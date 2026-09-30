@@ -19,32 +19,53 @@ export function registerSecret(value: string | undefined): void {
 }
 
 export function redact(input: unknown): unknown {
+  return redactInner(input, new WeakSet());
+}
+
+/**
+ * `seen` guards against cycles (an Error whose cause chain loops, a request object that
+ * references itself): without it a single log call overflows the stack and the logger
+ * throws from inside the caller's error path.
+ */
+function redactInner(input: unknown, seen: WeakSet<object>): unknown {
   if (typeof input === 'string') {
     let out = input;
     for (const s of secrets) out = out.split(s).join('[REDACTED]');
     return out;
   }
+  if (!input || typeof input !== 'object') return input;
+  // Track ANCESTORS only, so a value referenced twice (not cyclically) still prints.
+  if (seen.has(input)) return '[Circular]';
+  seen.add(input);
+  try {
+    return redactObject(input, seen);
+  } finally {
+    seen.delete(input);
+  }
+}
+
+function redactObject(input: object, seen: WeakSet<object>): unknown {
   if (input instanceof Error) {
     // Carry own enumerable props (e.g. RAError's status/endpoint) or the operator
     // would see strictly less than the model does.
     const extra: Record<string, unknown> = {};
     for (const k of Object.keys(input) as (keyof typeof input)[]) {
       if (k !== 'name' && k !== 'message' && k !== 'stack' && k !== 'cause') {
-        extra[k as string] = redact((input as unknown as Record<string, unknown>)[k as string]);
+        extra[k as string] = redactInner(
+          (input as unknown as Record<string, unknown>)[k as string],
+          seen,
+        );
       }
     }
     return {
       name: input.name,
-      message: redact(input.message),
+      message: redactInner(input.message, seen),
       ...extra,
-      ...(input.cause === undefined ? {} : { cause: redact(input.cause) }),
+      ...(input.cause === undefined ? {} : { cause: redactInner(input.cause, seen) }),
     };
   }
-  if (Array.isArray(input)) return input.map(redact);
-  if (input && typeof input === 'object') {
-    return Object.fromEntries(Object.entries(input).map(([k, v]) => [k, redact(v)]));
-  }
-  return input;
+  if (Array.isArray(input)) return input.map(v => redactInner(v, seen));
+  return Object.fromEntries(Object.entries(input).map(([k, v]) => [k, redactInner(v, seen)]));
 }
 
 export interface Logger {

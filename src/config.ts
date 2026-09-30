@@ -10,6 +10,8 @@ const csv = z
       .filter(Boolean),
   );
 
+const API_KEY_REQUIRED = 'RA_API_KEY (or RETROACHIEVEMENTS_API_KEY) is required';
+
 /**
  * Environment contract.
  *
@@ -17,7 +19,9 @@ const csv = z
  * because that is the name the official SDK docs (and many existing secrets) use.
  */
 const EnvSchema = z.object({
-  RA_API_KEY: z.string().min(1, 'RA_API_KEY (or RETROACHIEVEMENTS_API_KEY) is required'),
+  // `error` covers the missing case: blank values are normalised to undefined below, so
+  // `.min(1)`'s message alone would never be shown.
+  RA_API_KEY: z.string({ error: API_KEY_REQUIRED }).min(1, API_KEY_REQUIRED),
   /**
    * Default user for every user-scoped tool, so the common "my stats" case needs no
    * username argument (and spends no tokens on one). Optional: without it, user-scoped

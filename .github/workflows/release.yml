@@ -1,0 +1,174 @@
+name: Release
+
+# Tag-triggered ONLY, deliberately. A branch or workflow_dispatch run would produce a
+# provenance subject of `@refs/heads/...` instead of `@refs/tags/...`, and the consuming
+# cluster's Kyverno rule pins the tag subject. One trigger, one subject shape.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/retroachievements-mcp
+
+jobs:
+  # Re-verify the tagged commit rather than trusting a green branch build.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Tag matches package.json version
+        run: |
+          pkg="v$(node -p 'require("./package.json").version')"
+          [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != package.json $pkg"; exit 1; }
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  image:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless signing (Fulcio) for attestations
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      # arm64 as well as amd64: the cluster only needs amd64, but the image doubles as
+      # the `docker run -i … --stdio` local install, which includes Apple Silicon.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.pushed_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+
+      # SLSA build provenance, pushed to the registry as an OCI referrer. push-to-registry
+      # is REQUIRED: Kyverno resolves the attestation from the registry at admission.
+      # Verify: gh attestation verify oci://ghcr.io/sharkusmanch/retroachievements-mcp:vX.Y.Z --owner sharkusmanch
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # SPDX SBOM of the published image, attested and pushed alongside the provenance.
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest-sbom@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-sbom
+          path: sbom.spdx.json
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image published"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "First release? Set the GHCR package visibility to **public** or the cluster"
+            echo "cannot pull it and Kyverno cannot verify its attestation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # npm tarball as a release asset (installable with `npx <url>`), with its own provenance.
+  package:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - id: pack
+        run: echo "file=$(npm pack --ignore-scripts --silent | tail -1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ steps.pack.outputs.file }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ steps.pack.outputs.file }}
+      # Optional: publish to npmjs via Trusted Publishing (OIDC, no token). Enable by
+      # configuring the trusted publisher on npmjs.com and setting repo variable
+      # NPM_PUBLISH=true. Off by default so a missing npm setup never fails a release.
+      - if: vars.NPM_PUBLISH == 'true'
+        run: npm publish --provenance --access public ${{ steps.pack.outputs.file }}
+
+  github-release:
+    needs: [image, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: assets
+      - id: tgz
+        run: echo "name=$(cd assets && ls *.tgz)" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: assets/*
+          body: |
+            **Container:** `ghcr.io/${{ github.repository_owner }}/retroachievements-mcp:${{ github.ref_name }}`
+            (`${{ needs.image.outputs.digest }}`, linux/amd64 + linux/arm64, SLSA provenance + SPDX SBOM attested)
+
+            **npm tarball** (attached, with provenance):
+            `npx -y https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.tgz.outputs.name }}`

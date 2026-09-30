@@ -43,13 +43,17 @@ class Semaphore {
   private active = 0;
   constructor(private readonly max: number) {}
   async run<T>(fn: () => Promise<T>): Promise<T> {
+    // A released slot is HANDED to the next waiter (active stays constant) rather than
+    // freed and re-taken: otherwise a caller arriving in the microtask gap before the
+    // waiter resumes sees a free slot too, and the ceiling is exceeded.
     if (this.active >= this.max) await new Promise<void>(r => this.queue.push(r));
-    this.active++;
+    else this.active++;
     try {
       return await fn();
     } finally {
-      this.active--;
-      this.queue.shift()?.();
+      const next = this.queue.shift();
+      if (next) next();
+      else this.active--;
     }
   }
 }

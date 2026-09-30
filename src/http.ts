@@ -28,7 +28,6 @@ export function createApp(
   const { log } = ctx;
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '256kb' }));
 
   /**
    * Liveness/readiness, OUTSIDE the host guard and auth: a kubelet probe sends
@@ -56,7 +55,9 @@ export function createApp(
   }
 
   // Stateless: fresh McpServer + transport per request (see createServer).
-  app.post('/mcp', (req, res) => {
+  // Body parsing AFTER the Host guard and auth, so a rejected client costs no parse and
+  // gets its 403/401 rather than a 400 for a malformed body.
+  app.post('/mcp', express.json({ limit: '256kb' }), (req, res) => {
     void (async () => {
       const server = createServer(ctx);
       const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
