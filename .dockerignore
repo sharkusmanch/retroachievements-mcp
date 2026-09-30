@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+dist
+test
+coverage
+*.log
+.env
+.env.*
+.DS_Store
+README.md
+renovate.json

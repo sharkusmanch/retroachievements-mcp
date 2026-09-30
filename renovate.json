@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "timezone": "America/Los_Angeles",
+  "packageRules": [
+    {
+      "description": "Automerge non-major npm updates once CI is green.",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "MCP SDK majors are protocol-level changes and the transport package layout moved between v1 and v2. Always review by hand against a live Claude Code client before merging.",
+      "matchPackageNames": ["@modelcontextprotocol/**"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["mcp-sdk", "manual-review"]
+    },
+    {
+      "description": "Node runtime major in the Dockerfile ARG — pair with an engines bump.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}

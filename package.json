@@ -1,0 +1,62 @@
+{
+  "name": "@sharkusmanch/retroachievements-mcp",
+  "version": "0.1.0",
+  "description": "Token-efficient MCP server for the RetroAchievements Web API (stdio + Streamable HTTP)",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "retroachievements-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sharkusmanch/retroachievements-mcp.git"
+  },
+  "homepage": "https://github.com/sharkusmanch/retroachievements-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/sharkusmanch/retroachievements-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "retroachievements",
+    "retro-gaming",
+    "achievements",
+    "claude"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/express": "2.0.1",
+    "@modelcontextprotocol/node": "2.1.0",
+    "@modelcontextprotocol/server": "2.2.0",
+    "express": "^5.2.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@modelcontextprotocol/client": "2.2.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.4",
+    "eslint": "^9.39.5",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^3.2.7"
+  }
+}
