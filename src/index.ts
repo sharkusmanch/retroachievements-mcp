@@ -67,6 +67,9 @@ if (cfg.MCP_TRANSPORT === 'http') {
   // As PID 1 in `docker run -i`, node ignores SIGTERM unless a handler exists, so
   // `docker stop` would wait out its grace period. Nothing to drain in stdio mode.
   for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, () => process.exit(0));
+  // Client gone: exit now rather than lingering while an in-flight upstream retry or
+  // background catalog load finishes with nobody to answer.
+  process.stdin.on('end', () => process.exit(0));
   const server = createServer(ctx);
   await server.connect(new StdioServerTransport());
   log.info('retroachievements-mcp ready (stdio)', { version: VERSION });

@@ -133,6 +133,25 @@ describe('CatalogStore.get', () => {
     expect(await store.get(1, true)).toEqual([game(3, 1)]); // too old: refetched first
   });
 
+  it('backs off background refreshes for 15 minutes after an attempt', async () => {
+    vi.useFakeTimers();
+    let n = 0;
+    const { client, get } = fakeClient(() =>
+      ++n === 1 ? Promise.resolve([game(1, 1)]) : Promise.reject(new Error('down')),
+    );
+    const store = new CatalogStore(client, capLog().log, undefined);
+    await store.get(1, true);
+    vi.advanceTimersByTime(DAY);
+    for (let i = 0; i < 5; i++) {
+      expect(await store.get(1, true)).toEqual([game(1, 1)]); // stale copy keeps serving
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(get).toHaveBeenCalledTimes(2); // one failed refresh, not five
+    vi.advanceTimersByTime(15 * 60_000);
+    await store.get(1, true);
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+
   it('a failed load rejects and is retried on the next call', async () => {
     let n = 0;
     const { client, get } = fakeClient(() =>

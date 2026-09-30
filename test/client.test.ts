@@ -463,6 +463,27 @@ describe('retry', () => {
     expect(await b).toEqual({ ok: 1 });
   });
 
+  it('a 429 on the final attempt still starts the shared cooldown', async () => {
+    const { client, fetchMock } = setup(url =>
+      Promise.resolve(
+        url.searchParams.get('i') === '1'
+          ? json({ message: 'Too many requests' }, 429, { 'retry-after': '3' })
+          : json({ ok: 1 }),
+      ),
+    );
+    const a = client.get('GetGame', { i: 1 }, TTL.game).catch((e: unknown) => e);
+    // Four 429s, each followed by a 3s cooldown: the last one is not retried...
+    await vi.advanceTimersByTimeAsync(9_001);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(((await a) as RAError).status).toBe(429);
+    // ...but it still holds back the next request for the window.
+    const b = client.get('GetGame', { i: 2 }, TTL.game);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(await b).toEqual({ ok: 1 });
+  });
+
   it('stops retrying when the next attempt would pass the overall deadline', async () => {
     const { client, fetchMock } = setup(
       () =>

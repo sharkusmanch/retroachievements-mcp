@@ -336,7 +336,13 @@ export class RAClient {
       try {
         await this.bucket.take();
         const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
+        if (remaining <= 0) {
+          // The rate limiter (usually a 429 cooldown) consumed the whole budget.
+          if (lastErr === undefined) {
+            throw new RAError('rate limited (429 cooldown); retry shortly', 429, endpoint);
+          }
+          break;
+        }
         this.stats.upstreamCalls++;
         const res = await this.fetchImpl(url, {
           headers: {
@@ -353,15 +359,13 @@ export class RAClient {
           // 429s need a real pause (the window is ~a minute); 5xx a short one.
           const base = res.status === 429 ? 2000 : 500;
           const wait = retryAfterMs(res.headers.get('retry-after')) ?? base * 2 ** (attempt - 1);
+          // Shared cooldown: every queued request waits out the window with us (take()
+          // blocks until it ends), instead of drawing more 429s — applied even when this
+          // request is out of retries, since the others are not.
+          if (res.status === 429) this.bucket.pause(wait);
           if (canRetry(attempt, wait)) {
             this.log.warn('upstream retry', { endpoint, status: res.status, attempt, wait });
-            if (res.status === 429) {
-              // Shared cooldown: every queued request waits out the window with us
-              // (take() blocks until it ends), instead of drawing more 429s.
-              this.bucket.pause(wait);
-            } else {
-              await sleep(wait);
-            }
+            if (res.status !== 429) await sleep(wait);
             continue;
           }
         }

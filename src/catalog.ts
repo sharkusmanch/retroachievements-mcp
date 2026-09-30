@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { deepFreeze, TTL, type RAClient } from './client.js';
@@ -29,6 +30,8 @@ interface Stored {
  */
 const REFRESH_AFTER_MS = TTL.catalog * 1000;
 const MAX_STALE_MS = 7 * 24 * 3600 * 1000;
+/** Minimum gap between background refresh attempts of one catalog. */
+const REFRESH_RETRY_MS = 15 * 60_000;
 
 /** Keep only the fields find_games uses; GetGameList rows carry more (icons, hashes). */
 function slim(g: CatalogGame): CatalogGame {
@@ -107,8 +110,15 @@ export class CatalogStore {
     return true;
   }
 
+  private readonly lastRefreshAttempt = new Map<string, number>();
+
   private refreshInBackground(k: string, consoleId: number, f: boolean): void {
     if (this.refreshing.has(k)) return;
+    // Back off after an attempt (successful or not): while RA is down or rate-limiting,
+    // every find_games call would otherwise launch a fresh ~50-console refresh round.
+    const last = this.lastRefreshAttempt.get(k) ?? 0;
+    if (Date.now() - last < REFRESH_RETRY_MS) return;
+    this.lastRefreshAttempt.set(k, Date.now());
     this.refreshing.add(k);
     void this.fetchUpstream(k, consoleId, f)
       .catch((e: unknown) =>
@@ -212,7 +222,7 @@ export class CatalogStore {
     if (!this.dir) return;
     try {
       await mkdir(this.dir, { recursive: true });
-      const tmp = join(this.dir, `${k}.json.${process.pid}.tmp`);
+      const tmp = join(this.dir, `${k}.json.${randomUUID()}.tmp`);
       await writeFile(tmp, JSON.stringify(s));
       await rename(tmp, join(this.dir, `${k}.json`));
     } catch (e) {
