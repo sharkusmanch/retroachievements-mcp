@@ -65,6 +65,10 @@ jobs:
             type=ref,event=tag
       - id: build
         uses: docker/build-push-action@v7
+        env:
+          # Otherwise a *.dockerbuild record is uploaded as a run artifact and would be
+          # swept into the GitHub release by the download step below.
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -88,6 +92,8 @@ jobs:
           push-to-registry: true
 
       # SPDX SBOM of the published image, attested and pushed alongside the provenance.
+      # NOTE: syft resolves the multi-arch index to the runner's platform, so the SBOM
+      # content is the linux/amd64 image; the arm64 image differs only in the node binary.
       - uses: anchore/sbom-action@v0
         with:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
@@ -158,6 +164,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
+          pattern: '{npm-package,image-sbom}'
           merge-multiple: true
           path: assets
       - id: tgz

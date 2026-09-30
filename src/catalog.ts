@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { TTL, type RAClient } from './client.js';
+import { deepFreeze, TTL, type RAClient } from './client.js';
 import type { Logger } from './logger.js';
 
 export interface CatalogGame {
@@ -13,16 +13,40 @@ export interface CatalogGame {
   NumLeaderboards?: number;
   Points?: number;
   DateModified?: string | null;
-  Hashes?: string[];
 }
 
 interface Stored {
   fetched: number;
-  games: CatalogGame[];
+  games: readonly CatalogGame[];
 }
 
-/** Catalog lifetime. Sets are added/revised daily at most; a day-old index is fine for search. */
-const CATALOG_MAX_AGE_MS = 24 * 3600 * 1000;
+/**
+ * Freshness policy (stale-while-revalidate). Sets are added/revised daily at most, so a
+ * catalog younger than TTL.catalog (24h) is served as-is; up to a week old it is still
+ * served immediately (a title search does not need today's additions) while a refresh
+ * runs in the background; older than that it is refetched before answering. If
+ * upstream is down, any disk copy — however old — beats an error.
+ */
+const REFRESH_AFTER_MS = TTL.catalog * 1000;
+const MAX_STALE_MS = 7 * 24 * 3600 * 1000;
+
+/** Keep only the fields find_games uses; GetGameList rows carry more (icons, hashes). */
+function slim(g: CatalogGame): CatalogGame {
+  const out: CatalogGame = {
+    ID: g.ID,
+    Title: g.Title,
+    ConsoleID: g.ConsoleID,
+    ConsoleName: g.ConsoleName,
+  };
+  if (g.NumAchievements !== undefined) out.NumAchievements = g.NumAchievements;
+  if (g.Points !== undefined) out.Points = g.Points;
+  if (g.NumLeaderboards !== undefined) out.NumLeaderboards = g.NumLeaderboards;
+  if (g.DateModified !== undefined) out.DateModified = g.DateModified;
+  return out;
+}
+
+const project = (games: readonly CatalogGame[]): readonly CatalogGame[] =>
+  deepFreeze(games.map(slim));
 
 export function defaultCacheDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const base = env.XDG_CACHE_HOME || (homedir() ? join(homedir(), '.cache') : undefined);
@@ -41,7 +65,8 @@ export function defaultCacheDir(env: NodeJS.ProcessEnv = process.env): string | 
  */
 export class CatalogStore {
   private readonly mem = new Map<string, Stored>();
-  private readonly loading = new Map<string, Promise<CatalogGame[]>>();
+  private readonly loading = new Map<string, Promise<readonly CatalogGame[]>>();
+  private readonly refreshing = new Set<string>();
 
   constructor(
     private readonly client: RAClient,
@@ -49,68 +74,111 @@ export class CatalogStore {
     private readonly dir: string | undefined,
   ) {}
 
-  private key(consoleId: number, withAchievements: boolean, hashes: boolean): string {
-    return `c${consoleId}-f${withAchievements ? 1 : 0}-h${hashes ? 1 : 0}`;
+  // The `-h0` suffix is historical (a hashes variant once existed); kept so existing
+  // on-disk caches stay valid.
+  private key(consoleId: number, withAchievements: boolean): string {
+    return `c${consoleId}-f${withAchievements ? 1 : 0}-h0`;
   }
 
-  /** Returns the catalog if it is already in memory and fresh (no I/O). */
-  peek(consoleId: number, withAchievements: boolean, hashes: boolean): CatalogGame[] | undefined {
-    const s = this.mem.get(this.key(consoleId, withAchievements, hashes));
-    return s && Date.now() - s.fetched < CATALOG_MAX_AGE_MS ? s.games : undefined;
+  /** Returns the catalog if it is already in memory and servable (no I/O). */
+  peek(consoleId: number, withAchievements: boolean): readonly CatalogGame[] | undefined {
+    const s = this.mem.get(this.key(consoleId, withAchievements));
+    return s && Date.now() - s.fetched < MAX_STALE_MS ? s.games : undefined;
   }
 
-  get(consoleId: number, withAchievements: boolean, hashes: boolean): Promise<CatalogGame[]> {
-    const k = this.key(consoleId, withAchievements, hashes);
-    const warm = this.peek(consoleId, withAchievements, hashes);
-    if (warm) return Promise.resolve(warm);
+  get(consoleId: number, withAchievements: boolean): Promise<readonly CatalogGame[]> {
+    const k = this.key(consoleId, withAchievements);
+    const warm = this.mem.get(k);
+    if (warm && this.serveable(k, warm, consoleId, withAchievements)) {
+      return Promise.resolve(warm.games);
+    }
     const pending = this.loading.get(k);
     if (pending) return pending;
-    const p = this.load(k, consoleId, withAchievements, hashes).finally(() =>
-      this.loading.delete(k),
-    );
+    const p = this.load(k, consoleId, withAchievements).finally(() => this.loading.delete(k));
     this.loading.set(k, p);
     return p;
+  }
+
+  /** Servable now? Kicks off a background refresh when stale-but-usable. */
+  private serveable(k: string, s: Stored, consoleId: number, f: boolean): boolean {
+    const age = Date.now() - s.fetched;
+    if (age >= MAX_STALE_MS) return false;
+    if (age >= REFRESH_AFTER_MS) this.refreshInBackground(k, consoleId, f);
+    return true;
+  }
+
+  private refreshInBackground(k: string, consoleId: number, f: boolean): void {
+    if (this.refreshing.has(k)) return;
+    this.refreshing.add(k);
+    void this.fetchUpstream(k, consoleId, f)
+      .catch((e: unknown) =>
+        this.log.warn('catalog background refresh failed', { consoleId, error: e }),
+      )
+      .finally(() => this.refreshing.delete(k));
   }
 
   private async load(
     k: string,
     consoleId: number,
     withAchievements: boolean,
-    hashes: boolean,
-  ): Promise<CatalogGame[]> {
-    const disk = await this.readDisk(k);
-    if (disk && Date.now() - disk.fetched < CATALOG_MAX_AGE_MS) {
+  ): Promise<readonly CatalogGame[]> {
+    const disk = this.mem.get(k) ?? (await this.readDisk(k));
+    if (disk && this.serveable(k, disk, consoleId, withAchievements)) {
       this.mem.set(k, disk);
       return disk.games;
     }
+    try {
+      return await this.fetchUpstream(k, consoleId, withAchievements);
+    } catch (e) {
+      if (!disk) throw e;
+      // Upstream down: a week-plus-old index still answers "what's the game ID".
+      this.log.warn('catalog refresh failed; serving stale copy', {
+        consoleId,
+        ageHours: Math.round((Date.now() - disk.fetched) / 3_600_000),
+        error: e,
+      });
+      this.mem.set(k, disk);
+      return disk.games;
+    }
+  }
+
+  private async fetchUpstream(
+    k: string,
+    consoleId: number,
+    withAchievements: boolean,
+  ): Promise<readonly CatalogGame[]> {
     // TTL.none: this store owns catalog caching; don't also hold it in the LRU.
-    const games =
+    const raw =
       (await this.client.get<CatalogGame[] | null>(
         'GetGameList',
-        { i: consoleId, f: withAchievements, h: hashes },
+        { i: consoleId, f: withAchievements },
         TTL.none,
       )) ?? [];
-    const stored = { fetched: Date.now(), games };
+    const stored: Stored = { fetched: Date.now(), games: project(raw) };
     this.mem.set(k, stored);
     void this.writeDisk(k, stored);
-    return games;
+    return stored.games;
   }
 
   /**
    * Load many catalogs within `budgetMs`. Loads that miss the budget CONTINUE in the
-   * background (so the next call finds them warm); the result reports what is missing.
+   * background (so the next call finds them warm); the result reports which consoles
+   * are still `loading` and which `failed`.
    */
   async getMany(
     consoleIds: number[],
     withAchievements: boolean,
-    hashes: boolean,
     budgetMs: number,
-  ): Promise<{ games: CatalogGame[]; missing: number[] }> {
-    const done = new Map<number, CatalogGame[]>();
+  ): Promise<{ games: CatalogGame[]; loading: number[]; failed: number[] }> {
+    const done = new Map<number, readonly CatalogGame[]>();
+    const failed = new Set<number>();
     const all = consoleIds.map(id =>
-      this.get(id, withAchievements, hashes).then(
+      this.get(id, withAchievements).then(
         g => void done.set(id, g),
-        e => this.log.warn('catalog load failed', { consoleId: id, error: e as unknown }),
+        (e: unknown) => {
+          failed.add(id);
+          this.log.warn('catalog load failed', { consoleId: id, error: e });
+        },
       ),
     );
     let timer: NodeJS.Timeout | undefined;
@@ -123,7 +191,8 @@ export class CatalogStore {
     clearTimeout(timer);
     return {
       games: consoleIds.flatMap(id => done.get(id) ?? []),
-      missing: consoleIds.filter(id => !done.has(id)),
+      loading: consoleIds.filter(id => !done.has(id) && !failed.has(id)),
+      failed: consoleIds.filter(id => failed.has(id)),
     };
   }
 
@@ -131,7 +200,9 @@ export class CatalogStore {
     if (!this.dir) return undefined;
     try {
       const s = JSON.parse(await readFile(join(this.dir, `${k}.json`), 'utf8')) as Stored;
-      return typeof s.fetched === 'number' && Array.isArray(s.games) ? s : undefined;
+      return typeof s.fetched === 'number' && Array.isArray(s.games)
+        ? { fetched: s.fetched, games: project(s.games) }
+        : undefined;
     } catch {
       return undefined;
     }

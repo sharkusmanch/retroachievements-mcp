@@ -1,10 +1,13 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { TTL } from '../client.js';
-import { bool, clean, num, paginate, table, ts, type ToolResult } from '../format.js';
+import { ENDPOINT_TTL, TTL, type Endpoint } from '../client.js';
+import { bool, clean, flag, num, paginate, table, ts, type ToolResult } from '../format.js';
 import {
+  awardKind,
   handler,
+  lean,
   limitParam,
+  pageBucket,
   offsetParam,
   READ_ONLY,
   resolveUser,
@@ -13,50 +16,11 @@ import {
 } from './common.js';
 
 /**
- * Every documented Web API endpoint (docs site, 38) plus GetGameRating (SDK-only), without
- * the `API_` prefix / `.php` suffix. The `ra_api_raw` enum — keep in sync with the docs.
+ * Every documented Web API endpoint (38), without the `API_` prefix / `.php` suffix —
+ * the keys of ENDPOINT_TTL, so the list and the per-endpoint cache policy can't drift.
+ * (GetGameRating is gone upstream: 410.)
  */
-export const ENDPOINTS = [
-  'GetAchievementCount',
-  'GetAchievementDistribution',
-  'GetAchievementOfTheWeek',
-  'GetAchievementUnlocks',
-  'GetAchievementsEarnedBetween',
-  'GetAchievementsEarnedOnDay',
-  'GetActiveClaims',
-  'GetClaims',
-  'GetComments',
-  'GetConsoleIDs',
-  'GetGame',
-  'GetGameExtended',
-  'GetGameHashes',
-  'GetGameInfoAndUserProgress',
-  'GetGameLeaderboards',
-  'GetGameList',
-  'GetGameProgression',
-  'GetGameRankAndScore',
-  'GetGameRating',
-  'GetLeaderboardEntries',
-  'GetRecentGameAwards',
-  'GetTicketData',
-  'GetTopTenUsers',
-  'GetUserAwards',
-  'GetUserClaims',
-  'GetUserCompletedGames',
-  'GetUserCompletionProgress',
-  'GetUserGameLeaderboards',
-  'GetUserGameRankAndScore',
-  'GetUserPoints',
-  'GetUserProfile',
-  'GetUserProgress',
-  'GetUserRecentAchievements',
-  'GetUserRecentlyPlayedGames',
-  'GetUserSetRequests',
-  'GetUserSummary',
-  'GetUserWantToPlayList',
-  'GetUsersFollowingMe',
-  'GetUsersIFollow',
-] as const;
+export const ENDPOINTS = Object.keys(ENDPOINT_TTL) as Endpoint[];
 
 // ---------- upstream shapes ----------
 
@@ -171,9 +135,9 @@ function onlyFor(
 }
 
 /** Upstream-paginated page: `next_offset` only when a further page is likely. */
-function upstreamPage(offset: number, got: number, limit: number, total?: number) {
+function upstreamPage(offset: number, got: number, limit: number, total?: number, raw = got) {
   const next = offset + got;
-  const more = total !== undefined ? next < total : got >= limit;
+  const more = total !== undefined ? next < total : raw > got || got >= limit;
   return {
     ...(offset > 0 ? { offset } : {}),
     ...(more ? { next_offset: next } : {}),
@@ -205,7 +169,7 @@ function ticketRows(tickets: RawTicket[], details: boolean, withGame: boolean) {
     ['console', t => (withGame ? t.ConsoleName : undefined)],
     ['reporter', t => t.ReportedBy],
     ['reported', t => ts(t.ReportedAt)],
-    ['hardcore', t => bool(t.Hardcore)],
+    ['hardcore', t => flag(bool(t.Hardcore))],
     ['note', t => clip(t.ReportNotes, details ? NOTE_LONG : NOTE_SHORT)],
     ['author', t => (details ? t.AchievementAuthor : undefined)],
     ['resolved', t => (details ? ts(t.ResolvedAt) : undefined)],
@@ -218,27 +182,26 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
     'get_feed',
     {
       description:
-        'Site-wide feeds: Achievement of the Week, top ten users, recent game awards, active set claims, or finished (completed/dropped/expired) claims.',
-      inputSchema: z.object({
-        kind: z.enum(['aotw', 'top_users', 'recent_awards', 'active_claims', 'claims']),
-        date: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD')
-          .optional()
-          .describe('recent_awards: start date YYYY-MM-DD'),
-        award_kind: z
-          .enum(['mastered', 'completed', 'beaten_hardcore', 'beaten_softcore'])
-          .optional()
-          .describe('recent_awards filter'),
-        claim_kind: z
-          .enum(['completed', 'dropped', 'expired'])
-          .optional()
-          .describe('claims: default completed'),
-        console_id: z.number().int().positive().optional().describe('Claims: console filter'),
-        game_id: z.number().int().positive().optional().describe('Claims: game filter'),
-        limit: limitParam(10, 500),
-        offset: offsetParam,
-      }),
+        'Site feeds: aotw (Achievement of the Week), top_users, recent_awards, active_claims, claims (finished).',
+      inputSchema: lean(
+        z.object({
+          kind: z.enum(['aotw', 'top_users', 'recent_awards', 'active_claims', 'claims']),
+          // Format checked in the handler: a regex here would be advertised to the model.
+          date: z.string().max(10).optional().describe('recent_awards: start day'),
+          award_kind: z
+            .enum(['mastered', 'completed', 'beaten_hardcore', 'beaten_softcore'])
+            .optional()
+            .describe('recent_awards'),
+          claim_kind: z
+            .enum(['completed', 'dropped', 'expired'])
+            .optional()
+            .describe('claims; default completed'),
+          console_id: z.number().int().positive().optional().describe('claims filter'),
+          game_id: z.number().int().positive().optional().describe('claims filter'),
+          limit: limitParam(10, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -248,6 +211,9 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
         onlyFor(kind, ['recent_awards'], { date, award_kind });
         onlyFor(kind, ['claims'], { claim_kind });
         onlyFor(kind, ['active_claims', 'claims'], { console_id, game_id });
+        if (date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+          throw new ToolInputError('"date" must be YYYY-MM-DD');
+        }
 
         switch (kind) {
           case 'aotw': {
@@ -265,7 +231,7 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
                 title: a.Title,
                 description: a.Description,
                 points: a.Points,
-                retro_points: a.TrueRatio,
+                retro: a.TrueRatio,
                 type: a.Type,
                 author: a.Author,
               },
@@ -273,14 +239,14 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
               start: day(r.StartAt),
               players: r.TotalPlayers,
               unlocks: r.UnlocksCount,
-              hardcore_unlocks: r.UnlocksHardcoreCount,
+              unlocks_hc: r.UnlocksHardcoreCount,
               recent: table(page.items, [
                 ['date', u => ts(u.DateAwarded)],
                 ['user', u => u.User],
                 ['points', u => u.RAPoints],
                 // Almost every AotW unlock is hardcore: flag only the exceptions so the
                 // column disappears entirely in the common case.
-                ['softcore', u => (bool(u.HardcoreMode) === false ? true : undefined)],
+                ['softcore', u => flag(bool(u.HardcoreMode) === false)],
               ]),
               ...page.meta,
             };
@@ -295,13 +261,14 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
                 ['rank', x => x.rank],
                 ['user', x => x.u['1']],
                 ['points', x => num(x.u['2'])],
-                ['retro_points', x => num(x.u['3'])],
+                ['retro', x => num(x.u['3'])],
               ],
             );
           }
 
           case 'recent_awards': {
-            const count = Math.min(limit, 100); // upstream maximum
+            // Upstream max 100; bucketed (shared cache entries) and sliced here.
+            const count = pageBucket(limit, 100);
             const r = await ctx.client.get<{ Total?: number; Results?: RawGameAward[] } | null>(
               'GetRecentGameAwards',
               {
@@ -312,18 +279,19 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
               },
               TTL.feed,
             );
-            const rows = r?.Results ?? [];
+            const raw = r?.Results ?? [];
+            const rows = raw.slice(0, limit);
             return {
               total: r?.Total,
               ...table(rows, [
                 ['date', a => ts(a.AwardDate)],
                 ['user', a => a.User],
-                ['award', a => (award_kind ? undefined : a.AwardKind)],
+                ['award', a => (award_kind ? undefined : awardKind(a.AwardKind))],
                 ['game_id', a => a.GameID],
                 ['game', a => a.GameTitle],
                 ['console', a => a.ConsoleName],
               ]),
-              ...upstreamPage(offset, rows.length, count, r?.Total),
+              ...upstreamPage(offset, rows.length, limit, r?.Total, raw.length),
             };
           }
 
@@ -349,7 +317,6 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
               );
             const page = paginate(filtered, offset, limit);
             return {
-              ...(active ? {} : { claim_kind: claim_kind ?? 'completed' }),
               // GetClaims silently stops at the newest 1000 claims.
               ...(!active && all.length >= 1000
                 ? { note: 'upstream lists only the latest 1000' }
@@ -360,8 +327,8 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
                 ['game', c => c.GameTitle],
                 ['console', c => (console_id === undefined ? c.ConsoleName : undefined)],
                 ['set', c => (c.SetType === 1 ? 'revision' : 'new')],
-                ['collab', c => (c.ClaimType === 1 ? true : undefined)],
-                ['jr_dev', c => (bool(c.UserIsJrDev) ? true : undefined)],
+                ['collab', c => flag(c.ClaimType === 1)],
+                ['jr_dev', c => flag(bool(c.UserIsJrDev))],
                 ['created', c => day(c.Created)],
                 // DoneTime is the (planned) expiry; a dropped/completed claim ended at Updated.
                 [
@@ -382,18 +349,20 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
     'get_comments',
     {
       description:
-        "Read the comment wall of a game, achievement or user. Automated 'Server' log entries are hidden unless include_system is set.",
-      inputSchema: z.object({
-        target: z.enum(['game', 'achievement', 'user']),
-        id: z
-          .union([z.number().int().positive(), z.string().min(1).max(64)])
-          .optional()
-          .describe('Game/achievement ID or username; user defaults to configured'),
-        sort: z.enum(['newest', 'oldest']).default('newest'),
-        include_system: z.boolean().default(false).describe('Include automated edit logs'),
-        limit: limitParam(10, 500),
-        offset: offsetParam,
-      }),
+        'Comment wall of a game, achievement or user (system log entries hidden unless include_system).',
+      inputSchema: lean(
+        z.object({
+          target: z.enum(['game', 'achievement', 'user']),
+          id: z
+            .union([z.number().int().positive(), z.string().min(1).max(64)])
+            .optional()
+            .describe('ID, or username for user (default configured)'),
+          sort: z.enum(['newest', 'oldest']).default('newest'),
+          include_system: z.boolean().default(false),
+          limit: limitParam(10, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(ctx, 'get_comments', async ({ target, id, sort, include_system, limit, offset }) => {
@@ -412,7 +381,7 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
         {
           t: { game: 1, achievement: 2, user: 3 }[target],
           i: ident,
-          c: limit,
+          c: pageBucket(limit),
           o: offset || undefined,
           sort: sort === 'newest' ? '-submitted' : 'submitted',
         },
@@ -420,7 +389,8 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
       );
       // An empty / disabled wall comes back as a bare [] rather than {Total: 0}.
       const res = Array.isArray(r) || !r ? {} : r;
-      const rows = res.Results ?? [];
+      const raw = res.Results ?? [];
+      const rows = raw.slice(0, limit);
       // Paging stays upstream-based, so hiding system rows can leave a short page.
       const shown = include_system ? rows : rows.filter(c => c.User !== 'Server');
       const hidden = rows.length - shown.length;
@@ -432,7 +402,7 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
           ['user', c => c.User],
           ['text', c => clip(c.CommentText, COMMENT_MAX)],
         ]),
-        ...upstreamPage(offset, rows.length, limit, res.Total ?? 0),
+        ...upstreamPage(offset, rows.length, limit, res.Total ?? 0, raw.length),
       };
     }),
   );
@@ -441,21 +411,18 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
     'get_tickets',
     {
       description:
-        'Achievement bug-report tickets: recent tickets, one ticket, a game/achievement/developer ticket summary, or the most-ticketed games.',
-      inputSchema: z.object({
-        mode: z.enum(['recent', 'ticket', 'game', 'achievement', 'developer', 'most_ticketed']),
-        id: z.number().int().positive().optional().describe('Ticket/game/achievement ID'),
-        user: z
-          .string()
-          .min(1)
-          .max(64)
-          .optional()
-          .describe('developer: username/ULID; defaults to configured'),
-        unofficial: z.boolean().optional().describe('game: unofficial achievements'),
-        details: z.boolean().default(false).describe('Full notes, author, resolution'),
-        limit: limitParam(10, 100),
-        offset: offsetParam,
-      }),
+        'Achievement bug tickets: recent, one ticket, per game/achievement/developer summary, or most_ticketed games.',
+      inputSchema: lean(
+        z.object({
+          mode: z.enum(['recent', 'ticket', 'game', 'achievement', 'developer', 'most_ticketed']),
+          id: z.number().int().positive().optional().describe('ticket/game/achievement ID'),
+          user: z.string().min(1).max(64).optional().describe('developer; default configured'),
+          unofficial: z.boolean().optional().describe('game mode'),
+          details: z.boolean().default(false).describe('Full notes + resolution'),
+          limit: limitParam(10, 100),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(ctx, 'get_tickets', async ({ mode, id, user, unofficial, details, limit, offset }) => {
@@ -473,14 +440,15 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
       switch (mode) {
         case 'recent': {
           const r = await get<{ RecentTickets?: RawTicket[]; OpenTickets?: number }>({
-            c: limit,
+            c: pageBucket(limit, 100),
             o: offset || undefined,
           });
-          const rows = r?.RecentTickets ?? [];
+          const raw = r?.RecentTickets ?? [];
+          const rows = raw.slice(0, limit);
           return {
             open_total: r?.OpenTickets,
             ...ticketRows(rows, details, true),
-            ...upstreamPage(offset, rows.length, limit),
+            ...upstreamPage(offset, rows.length, limit, undefined, raw.length),
           };
         }
 
@@ -502,7 +470,7 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
             game: { id: t.GameID, title: t.GameTitle, console: t.ConsoleName },
             reporter: t.ReportedBy,
             reported: ts(t.ReportedAt),
-            hardcore: bool(t.Hardcore),
+            hardcore: flag(bool(t.Hardcore)),
             note: clip(t.ReportNotes, NOTE_LONG),
             resolved: ts(t.ResolvedAt),
             resolved_by: t.ResolvedBy,
@@ -582,8 +550,9 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
               Console: string;
               OpenTickets: number | string;
             }[];
-          }>({ f: 1, c: limit, o: offset || undefined });
-          const rows = r?.MostReportedGames ?? [];
+          }>({ f: 1, c: pageBucket(limit, 100), o: offset || undefined });
+          const raw = r?.MostReportedGames ?? [];
+          const rows = raw.slice(0, limit);
           return {
             ...table(rows, [
               ['game_id', g => num(g.GameID)],
@@ -591,7 +560,7 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
               ['console', g => g.Console],
               ['open_tickets', g => num(g.OpenTickets)],
             ]),
-            ...upstreamPage(offset, rows.length, limit),
+            ...upstreamPage(offset, rows.length, limit, undefined, raw.length),
           };
         }
       }
@@ -602,15 +571,18 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
     'ra_api_raw',
     {
       description:
-        'Escape hatch: call any RetroAchievements Web API endpoint and get its (truncated) JSON. Prefer the dedicated tools; use this only for fields they omit.',
-      inputSchema: z.object({
-        endpoint: z.enum(ENDPOINTS).describe('Name without API_ prefix/.php'),
-        params: z
-          .record(z.string().min(1).max(32), z.union([z.string().max(200), z.number()]))
-          .default({})
-          .describe('Query params, without y'),
-        max_chars: z.number().int().min(200).max(60_000).default(8000).describe('Output cap'),
-      }),
+        'Escape hatch: raw JSON from any RA Web API endpoint (e.g. GetGameExtended). Prefer the dedicated tools.',
+      inputSchema: lean(
+        z.object({
+          // Free string (validated below) rather than a 38-value enum in every tools/list.
+          endpoint: z.string().max(64).describe('Name without API_/.php'),
+          params: z
+            .record(z.string().min(1).max(32), z.union([z.string().max(200), z.number()]))
+            .default({})
+            .describe('Query params (key added)'),
+          max_chars: z.number().int().min(200).max(60_000).default(8000),
+        }),
+      ),
       annotations: READ_ONLY,
     },
     async args => {
@@ -619,10 +591,18 @@ export function registerCommunityTools(server: McpServer, ctx: ToolContext): voi
         ctx,
         'ra_api_raw',
         async ({ endpoint, params, max_chars }: typeof args) => {
+          const name = endpoint.replace(/^API_/i, '').replace(/\.php$/i, '');
+          const ep = ENDPOINTS.find(e => e.toLowerCase() === name.toLowerCase());
+          if (!ep) {
+            throw new ToolInputError(
+              `Unknown endpoint "${endpoint}". Valid: ${ENDPOINTS.join(', ')}`,
+            );
+          }
           if (Object.keys(params).some(k => k.toLowerCase() === 'y')) {
             throw new ToolInputError('"y" (the API key) is injected by the server; remove it.');
           }
-          const data = await ctx.client.get<unknown>(endpoint, params, TTL.feed);
+          // Per-endpoint default TTL (ENDPOINT_TTL), same freshness as the dedicated tools.
+          const data = await ctx.client.get<unknown>(ep, params);
           text = rawText(data, max_chars);
           return true;
         },

@@ -11,10 +11,11 @@ describe('loadConfig', () => {
       RA_BASE_URL: 'https://retroachievements.org',
       RA_TIMEOUT_MS: 20_000,
       RA_MAX_CONCURRENCY: 4,
-      RA_RATE_PER_MINUTE: 60,
-      RA_RATE_BURST: 8,
+      RA_RATE_PER_MINUTE: 72,
+      RA_RATE_BURST: 10,
       RA_PREWARM_CATALOG: false,
       RA_CACHE_MAX_ENTRIES: 500,
+      RA_CACHE_MAX_BYTES: 64 * 1024 * 1024,
       RA_CACHE_TTL_SCALE: 1,
       MCP_TRANSPORT: 'stdio',
       MCP_HOST: '127.0.0.1',
@@ -81,6 +82,22 @@ describe('loadConfig', () => {
       expect((e as Error).message).toMatch(/RA_TIMEOUT_MS/);
       expect((e as Error).message).not.toContain(secret);
     }
+  });
+
+  it('normalises MCP_ALLOWED_HOSTS entries (case, port, IPv6 brackets, dedupe)', () => {
+    expect(
+      loadConfig({
+        ...KEY,
+        MCP_ALLOWED_HOSTS: 'RA.Example.com:443, ra.example.com, ::1, [::1]:8080, 10.0.0.1:80, *',
+      }).MCP_ALLOWED_HOSTS,
+    ).toEqual(['ra.example.com', '[::1]', '10.0.0.1', '*']);
+  });
+
+  it('MCP_ALLOWED_HOSTS=* satisfies the non-loopback rule (explicit opt-out)', () => {
+    expect(
+      loadConfig({ ...KEY, MCP_TRANSPORT: 'http', MCP_HOST: '0.0.0.0', MCP_ALLOWED_HOSTS: '*' })
+        .MCP_ALLOWED_HOSTS,
+    ).toEqual(['*']);
   });
 
   it('parses MCP_ALLOWED_HOSTS as a trimmed CSV', () => {

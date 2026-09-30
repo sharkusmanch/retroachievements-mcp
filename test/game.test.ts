@@ -4,6 +4,7 @@ import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 import { RAError, TTL, type RAClient } from '../src/client.js';
 import type { CatalogGame, CatalogStore } from '../src/catalog.js';
 import type { Logger } from '../src/logger.js';
+import { frozen } from './helpers.js';
 import { pct, registerGameTools, scoreTitle, normalizeTitle } from '../src/tools/game.js';
 
 type Responder = (endpoint: string, params: Record<string, unknown>) => unknown;
@@ -17,12 +18,22 @@ const log: Logger = {
 
 async function setup(respond: Responder, catalogGames: CatalogGame[] = []) {
   const get = vi.fn((endpoint: string, params: Record<string, unknown>, _ttl: number) =>
-    Promise.resolve().then(() => respond(endpoint, params)),
+    Promise.resolve().then(() => frozen(respond(endpoint, params))),
   );
-  const getMany = vi.fn(() => Promise.resolve({ games: [...catalogGames], missing: [] }));
+  const peek = vi.fn((_endpoint: string, _params: Record<string, unknown>): unknown => undefined);
+  const peekAny = vi.fn(
+    (_endpoint: string, _params: Record<string, unknown>): unknown => undefined,
+  );
+  const getMany = vi.fn(() =>
+    Promise.resolve({
+      games: frozen([...catalogGames]),
+      loading: [] as number[],
+      failed: [] as number[],
+    }),
+  );
   const server = new McpServer({ name: 't', version: '0' });
   registerGameTools(server, {
-    client: { get } as unknown as RAClient,
+    client: { get, peek, peekAny } as unknown as RAClient,
     catalog: { getMany } as unknown as CatalogStore,
     log,
     defaultUser: 'me',
@@ -40,7 +51,7 @@ async function setup(respond: Responder, catalogGames: CatalogGame[] = []) {
       json: () => JSON.parse(text) as Record<string, unknown>,
     };
   };
-  return { get, getMany, call, client };
+  return { get, getMany, peek, peekAny, call, client };
 }
 
 // ---------- fixtures (trimmed real responses) ----------
@@ -200,13 +211,13 @@ describe('helpers', () => {
 // ---------- list_consoles / find_games ----------
 
 describe('list_consoles', () => {
-  it('filters non-game systems and uses the static TTL', async () => {
+  it('active game systems only, no params, static TTL', async () => {
     const { get, call } = await setup(() => [
       { ID: 1, Name: 'Genesis', Active: true, IsGameSystem: true },
       { ID: 100, Name: 'Hubs', Active: true, IsGameSystem: false },
       { ID: 2, Name: 'N64', Active: false, IsGameSystem: true },
     ]);
-    const r = (await call('list_consoles', { active_only: true })).json();
+    const r = (await call('list_consoles', {})).json();
     expect(r).toEqual({ cols: ['id', 'name'], rows: [[1, 'Genesis']] });
     expect(get).toHaveBeenCalledWith('GetConsoleIDs', {}, TTL.static);
   });
@@ -228,11 +239,45 @@ describe('find_games', () => {
   it('ranks matches and paginates', async () => {
     const { call, getMany } = await setup(() => [], games);
     const r = (await call('find_games', { query: 'sonic', console_id: 1, limit: 1 })).json();
-    expect(getMany).toHaveBeenCalledWith([1], true, false, expect.any(Number));
+    expect(getMany).toHaveBeenCalledWith([1], true, expect.any(Number));
     expect(r.console).toBe('Genesis');
     expect(r.rows).toEqual([[1, 'Sonic the Hedgehog', 400]]);
     expect(r.total).toBe(2);
     expect(r.next_offset).toBe(1);
+  });
+
+  it('all-console search loads only active game systems when has_achievements', async () => {
+    const consoles = [
+      { ID: 1, Name: 'Genesis', Active: true, IsGameSystem: true },
+      { ID: 2, Name: 'Old', Active: false, IsGameSystem: true },
+      { ID: 100, Name: 'Hubs', Active: true, IsGameSystem: false },
+    ];
+    const { call, getMany } = await setup(() => consoles, games);
+    await call('find_games', { query: 'sonic' });
+    expect(getMany).toHaveBeenLastCalledWith([1], true, expect.any(Number));
+    await call('find_games', { query: 'sonic', has_achievements: false });
+    expect(getMany).toHaveBeenLastCalledWith([1, 2], false, expect.any(Number));
+  });
+
+  it('incomplete distinguishes still-loading from failed consoles', async () => {
+    const { call, getMany } = await setup(() => [], games);
+    getMany.mockResolvedValueOnce({ games: [], loading: [1], failed: [2, 3] });
+    const r = (await call('find_games', { query: 'sonic', console_id: 1 })).json();
+    expect(r.incomplete).toMatch(/1\/1 consoles still loading/);
+    expect(r.incomplete).toMatch(/2\/1 consoles failed to load/);
+  });
+
+  it('sorts an unqueried console listing without mutating the (frozen) catalog', async () => {
+    const { call } = await setup(() => [], [...games].reverse());
+    const r = (await call('find_games', { console_id: 1 })).json();
+    expect((r.rows as unknown[][]).map(x => x[0])).toEqual([1, 2, 3]);
+  });
+
+  it('does not advertise include_hashes any more', async () => {
+    const { client } = await setup(() => []);
+    const { tools } = await client.listTools();
+    const fg = tools.find(t => t.name === 'find_games');
+    expect(Object.keys(fg?.inputSchema.properties ?? {})).not.toContain('include_hashes');
   });
 });
 
@@ -311,8 +356,8 @@ describe('get_game', () => {
     const r = (await call('get_game', { game_id: 1, include: ['claims'] })).json();
     expect(get.mock.calls.map(c => c[0])).toEqual(['GetGameExtended']);
     expect(r.claims).toEqual({
-      cols: ['user', 'set', 'kind', 'created', 'expires'],
-      rows: [['Scott', 'new', 'primary', '2012-11-02 00:00', '2012-11-02 00:00']],
+      cols: ['user', 'set', 'created', 'expires'],
+      rows: [['Scott', 'new', '2012-11-02 00:00', '2012-11-02 00:00']],
     });
     expect(r.achievement_list).toBeUndefined();
   });
@@ -324,7 +369,7 @@ describe('get_game', () => {
     ).json();
     expect(get).toHaveBeenCalledWith('GetGame', { i: 1 }, TTL.game);
     expect(get).toHaveBeenCalledWith('GetGameHashes', { i: 1 }, TTL.static);
-    expect(get).toHaveBeenCalledWith('GetGameProgression', { i: 1 }, TTL.game);
+    expect(get).toHaveBeenCalledWith('GetGameProgression', { i: 1 }, TTL.slow);
     expect(get).toHaveBeenCalledWith('GetAchievementDistribution', { i: 1 }, TTL.game);
     expect(get).toHaveBeenCalledTimes(4);
     expect(r.hashes).toEqual({
@@ -332,7 +377,8 @@ describe('get_game', () => {
       rows: [['1bc674be034e43c96b86487ac69d9293', 'Sonic (USA, Europe).md', 'nointro']],
     });
     expect(r.median_hours).toEqual({ beat: 2.2, beat_hc: 2.4, complete: 4.6, master: 8.2 });
-    expect(r.players_by_unlock_count).toEqual({ '1': 50, '2': 20, '3': 5 });
+    expect(r.players_by_unlocks_from_1).toEqual([50, 20, 5]);
+    expect(r.median_samples).toBeUndefined();
     // Without achievements, progression rows are ordered by median unlock time.
     const prog = r.achievement_progression as { cols: string[]; rows: unknown[][] };
     expect(prog.rows.map(x => x[0])).toEqual([9, 10, 11]);
@@ -357,6 +403,37 @@ describe('get_game', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it("base info reuses a warm GetGameExtended or any user's GetGameInfoAndUserProgress", async () => {
+    const { get, peek, peekAny, call } = await setup(gameResponder);
+    const cold = (await call('get_game', { game_id: 1 })).json();
+    expect(get).toHaveBeenCalledTimes(1);
+
+    peek.mockImplementation((ep: string) =>
+      ep === 'GetGameExtended' ? frozen(EXTENDED) : undefined,
+    );
+    const fromExt = (await call('get_game', { game_id: 1 })).json();
+    expect(get).toHaveBeenCalledTimes(1); // no upstream call
+    expect(fromExt).toEqual(cold); // same projection whatever the source
+
+    peek.mockReturnValue(undefined);
+    peekAny.mockImplementation((ep: string, p: Record<string, unknown>) =>
+      ep === 'GetGameInfoAndUserProgress' && p.g === 1
+        ? frozen({ ...GAME, ID: 1, NumAwardedToUser: 3, Achievements: {} })
+        : undefined,
+    );
+    const fromProgress = (await call('get_game', { game_id: 1 })).json();
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(fromProgress).toEqual(cold);
+    expect(peekAny).toHaveBeenCalledWith('GetGameInfoAndUserProgress', { g: 1 });
+  });
+
+  it('claims never come from GetGameInfoAndUserProgress (it lacks them)', async () => {
+    const { get, peekAny, call } = await setup(gameResponder);
+    peekAny.mockReturnValue(frozen({ ...GAME, ID: 1 }));
+    await call('get_game', { game_id: 1, include: ['claims'] });
+    expect(get.mock.calls.map(c => c[0])).toEqual(['GetGameExtended']);
+  });
+
   it('unknown game → not found', async () => {
     const { call } = await setup(() => []);
     expect((await call('get_game', { game_id: 999999 })).json()).toEqual({ result: 'not found' });
@@ -379,8 +456,6 @@ describe('get_game_rankings', () => {
     const r = (await call('get_game_rankings', { game_id: 1, type: 'latest_masters' })).json();
     expect(get).toHaveBeenCalledWith('GetGameRankAndScore', { g: 1, t: 1 }, TTL.feed);
     expect(r).toEqual({
-      game_id: 1,
-      type: 'latest_masters',
       cols: ['user', 'achievements', 'points', 'last_award'],
       rows: [['henrit', 35, 300, '2026-09-29 22:54']],
     });
@@ -430,18 +505,29 @@ describe('get_leaderboards', () => {
 
   it('lists game boards with upstream pagination', async () => {
     const { call, get } = await setup(() => boards);
-    const r = (await call('get_leaderboards', { game_id: 319, limit: 2 })).json();
-    expect(get).toHaveBeenCalledWith('GetGameLeaderboards', { i: 319, c: 2, o: 0 }, TTL.game);
+    const r = (await call('get_leaderboards', { game_id: 319, limit: 1 })).json();
+    // limit 1 → upstream page bucket 25 (shared cache entry), sliced locally.
+    expect(get).toHaveBeenCalledWith('GetGameLeaderboards', { i: 319, c: 25, o: 0 }, TTL.game);
     expect(r).toEqual({
-      game_id: 319,
-      cols: ['id', 'title', 'description', 'lower_better', 'state', 'top_user', 'top_score'],
-      rows: [
-        [188, 'Jetbike Racing', 'Try for 2,371 WP!', null, null, 'Xymjak', '002371'],
-        [260, 'Speedrun', 'Fastest', true, 'disabled', 'Warlock44', '2:16.00'],
-      ],
+      cols: ['id', 'title', 'description', 'top_user', 'top_score'],
+      rows: [[188, 'Jetbike Racing', 'Try for 2,371 WP!', 'Xymjak', '002371']],
       total: 5,
-      next_offset: 2,
+      next_offset: 1,
     });
+    const both = (await call('get_leaderboards', { game_id: 319, limit: 2 })).json();
+    expect(both.cols).toEqual([
+      'id',
+      'title',
+      'description',
+      'top_user',
+      'top_score',
+      'lower_better',
+      'state',
+    ]);
+    expect(both.rows).toEqual([
+      [188, 'Jetbike Racing', 'Try for 2,371 WP!', 'Xymjak', '002371'],
+      [260, 'Speedrun', 'Fastest', 'Warlock44', '2:16.00', 1, 'disabled'],
+    ]);
   });
 
   it('leaderboard entries', async () => {
@@ -462,7 +548,6 @@ describe('get_leaderboards', () => {
     const r = (await call('get_leaderboards', { leaderboard_id: 260, offset: 0 })).json();
     expect(get).toHaveBeenCalledWith('GetLeaderboardEntries', { i: 260, c: 25, o: 0 }, TTL.feed);
     expect(r).toEqual({
-      leaderboard_id: 260,
       cols: ['rank', 'user', 'score', 'date'],
       rows: [[1, 'Warlock44', '2:16.00', '2019-12-04 14:13']],
       total: 1,
@@ -470,9 +555,13 @@ describe('get_leaderboards', () => {
   });
 
   it("user entries default to the configured user; 422 'no leaderboards' is not an error", async () => {
-    let fail = false;
+    let fail: false | 'none' | 'other' = false;
     const { call, get } = await setup(() => {
-      if (fail) throw new RAError('HTTP 422', 422, 'GetUserGameLeaderboards');
+      if (fail === 'none') {
+        throw new RAError('User has no leaderboards on this game', 422, 'GetUserGameLeaderboards');
+      }
+      if (fail === 'other')
+        throw new RAError('The u field is invalid.', 422, 'GetUserGameLeaderboards');
       return {
         Count: 1,
         Total: 1,
@@ -499,12 +588,21 @@ describe('get_leaderboards', () => {
       { i: 319, u: 'me', c: 25, o: 0 },
       TTL.user,
     );
-    expect(r.rows).toEqual([[260, 'Speedrun', true, '2:16.00', 1, '2019-12-04 14:13']]);
+    expect(r.user).toBe('me'); // defaulted → echoed
+    expect(r.rows).toEqual([[260, 'Speedrun', '2:16.00', 1, '2019-12-04 14:13', 1]]);
 
-    fail = true;
+    const explicit = (await call('get_leaderboards', { game_id: 319, user: 'me' })).json();
+    expect(explicit.user).toBeUndefined(); // caller's own input is not echoed
+
+    fail = 'none';
     const none = await call('get_leaderboards', { game_id: 319, user: 'other' });
     expect(none.isError).toBe(false);
-    expect(none.json()).toMatchObject({ user: 'other', total: 0 });
+    expect(none.json()).toEqual({ total: 0, note: 'no leaderboard entries' });
+
+    fail = 'other';
+    const bad = await call('get_leaderboards', { game_id: 319, user: 'x' });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/422.*The u field is invalid/);
   });
 });
 
@@ -565,7 +663,7 @@ describe('get_achievement_unlocks', () => {
     const { call, get } = await setup(() => ({ ...unlocks, Unlocks: unlocks.Unlocks.slice(0, 2) }));
     const res = await call('get_achievement_unlocks', { achievement_id: 9, limit: 2, offset: 4 });
     const r = res.json();
-    expect(get).toHaveBeenCalledWith('GetAchievementUnlocks', { a: 9, c: 2, o: 4 }, TTL.feed);
+    expect(get).toHaveBeenCalledWith('GetAchievementUnlocks', { a: 9, c: 25, o: 4 }, TTL.feed);
     expect(r).toEqual({
       achievement: {
         id: 9,
@@ -585,8 +683,8 @@ describe('get_achievement_unlocks', () => {
       rarity_hc: 30,
       cols: ['user', 'date', 'hc'],
       rows: [
-        ['a', '2026-09-30 02:19', true],
-        ['b', '2026-09-30 02:07', false],
+        ['a', '2026-09-30 02:19', 1],
+        ['b', '2026-09-30 02:07'],
       ],
       offset: 4,
       next_offset: 6,
@@ -599,7 +697,7 @@ describe('get_achievement_unlocks', () => {
     const r = (
       await call('get_achievement_unlocks', { achievement_id: 9, hardcore_only: true, limit: 2 })
     ).json();
-    expect(get).toHaveBeenCalledWith('GetAchievementUnlocks', { a: 9, c: 8, o: 0 }, TTL.feed);
+    expect(get).toHaveBeenCalledWith('GetAchievementUnlocks', { a: 9, c: 25, o: 0 }, TTL.feed);
     expect(r.cols).toEqual(['user', 'date']);
     expect(r.rows).toEqual([
       ['a', '2026-09-30 02:19'],

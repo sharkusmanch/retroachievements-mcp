@@ -1,10 +1,14 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { TTL } from '../client.js';
-import { badgeUrl, imageUrl, num, paginate, table, ts } from '../format.js';
+import { badgeUrl, flag, imageUrl, num, paginate, table, ts } from '../format.js';
 import {
+  awardKind,
   handler,
+  imagesParam,
+  lean,
   limitParam,
+  pageBucket,
   offsetParam,
   READ_ONLY,
   resolveUser,
@@ -240,30 +244,16 @@ async function fetchAll<T>(
 }
 
 /** Page metadata for an upstream-paginated call: total when known, next_offset when more. */
-function upstreamMeta(offset: number, got: number, limit: number, total?: number) {
+function upstreamMeta(offset: number, got: number, limit: number, total?: number, raw = got) {
   const next = offset + got;
-  const more = total !== undefined ? next < total : got >= limit;
+  // Without a total: more likely remain if upstream returned more than we showed, or
+  // a full page.
+  const more = total !== undefined ? next < total : raw > got || got >= limit;
   return {
     ...(total !== undefined ? { total } : {}),
     ...(offset > 0 ? { offset } : {}),
     ...(more ? { next_offset: next } : {}),
   };
-}
-
-/** `HighestAwardKind` → short label. */
-function awardKind(k: string | null | undefined): string | undefined {
-  switch (k) {
-    case 'mastered':
-      return 'mastered';
-    case 'completed':
-      return 'completed';
-    case 'beaten-hardcore':
-      return 'beaten_hc';
-    case 'beaten-softcore':
-      return 'beaten';
-    default:
-      return k ?? undefined;
-  }
 }
 
 const isMastery = (k: string | null | undefined) => k === 'mastered' || k === 'completed';
@@ -277,15 +267,40 @@ const rarity = (awarded: unknown, players: unknown): number | undefined => {
   return a !== undefined && p ? Math.round((a / p) * 1000) / 10 : undefined;
 };
 
-/** ISO date or datetime → epoch seconds. Date-only `end` means end of that day (UTC). */
-function epoch(v: string, field: string, end = false): number {
-  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(v);
-  const iso = dateOnly ? `${v}T${end ? '23:59:59' : '00:00:00'}Z` : v;
+const ISO_DATETIME =
+  /^(\d{4})-(\d{2})-(\d{2})([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$/i;
+
+/**
+ * Strict ISO date/datetime → epoch seconds. Date-only `end` means end of that day (UTC).
+ * Rejects anything Date.parse would "helpfully" accept (`2026-02-30` rolls into March,
+ * `Sep 5` parses in local time): a wrong range silently returns the wrong unlocks.
+ */
+export function epoch(v: string, field: string, end = false): number {
+  const m = ISO_DATETIME.exec(v.trim());
+  const bad = () => new ToolInputError(`"${field}" must be an ISO date or datetime (UTC)`);
+  if (!m) throw bad();
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const cal = new Date(Date.UTC(y, mo - 1, d));
+  if (cal.getUTCFullYear() !== y || cal.getUTCMonth() !== mo - 1 || cal.getUTCDate() !== d) {
+    throw bad();
+  }
+  const day = `${m[1]}-${m[2]}-${m[3]}`;
+  const time = m[4] ? m[4].slice(1) : end ? '23:59:59' : '00:00:00';
   // Datetimes without an explicit zone are treated as UTC, like every RA timestamp.
-  const withZone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso}Z`;
-  const ms = Date.parse(withZone);
-  if (Number.isNaN(ms)) throw new ToolInputError(`"${field}" must be an ISO date or datetime`);
+  const zone = m[7] ?? 'Z';
+  const ms = Date.parse(`${day}T${time}${zone}`);
+  if (Number.isNaN(ms)) throw bad();
   return Math.floor(ms / 1000);
+}
+
+/** RA user ULIDs are Crockford base32, 26 chars. */
+const isUlid = (s: string | undefined) => !!s && /^[0-9A-HJKMNP-TV-Z]{26}$/i.test(s);
+
+/** Rows → `{games: {id: title}}` so a title repeated on every row is sent once. */
+function gameTitles<T>(rows: readonly T[], id: (r: T) => number, title: (r: T) => string) {
+  const games: Record<number, string> = {};
+  for (const r of rows) games[id(r)] ??= title(r);
+  return games;
 }
 
 const CLAIM_STATUS = ['active', 'complete', 'dropped'];
@@ -298,16 +313,15 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
     'get_user_profile',
     {
       description:
-        "A user's profile and point totals. Optionally add a summary (rank, status, recent games/unlocks) and/or site awards.",
-      inputSchema: z.object({
-        user: userParam,
-        include: z
-          .array(z.enum(['summary', 'awards']))
-          .default([])
-          .describe('Extra sections'),
-        limit: limitParam(25, 500).describe('Max award rows (default 25)'),
-        images: z.boolean().default(false).describe('Include image URLs'),
-      }),
+        'User profile and points. include: summary (rank, status, recent games/unlocks), awards.',
+      inputSchema: lean(
+        z.object({
+          user: userParam,
+          include: z.array(z.enum(['summary', 'awards'])).default([]),
+          limit: limitParam(25, 500).describe('Max award rows'),
+          images: imagesParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(ctx, 'get_user_profile', async ({ user, include, limit, images }) => {
@@ -322,13 +336,14 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         wantSummary
           ? ctx.client.get<RawSummary | null>('GetUserSummary', { u, g: 5, a: 10 }, TTL.user)
           : ctx.client.get<RawProfile | null>('GetUserProfile', { u }, TTL.user),
-        wantAwards ? ctx.client.get<RawAwards | null>('GetUserAwards', { u }, TTL.user) : null,
+        wantAwards ? ctx.client.get<RawAwards | null>('GetUserAwards', { u }, TTL.social) : null,
       ]);
       if (!p?.User) return null;
 
       const out: Record<string, unknown> = {
         user: p.User,
-        ulid: p.ULID,
+        // ULIDs are noise unless the caller is working with them.
+        ulid: isUlid(user) ? p.ULID : undefined,
         member_since: ts(p.MemberSince)?.slice(0, 10),
         motto: p.Motto,
         points: num(p.TotalPoints),
@@ -371,16 +386,22 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         const recent = Object.values(s.RecentAchievements ?? {})
           .flatMap(g => Object.values(g))
           .sort((a, b) => (a.DateAwarded < b.DateAwarded ? 1 : -1));
-        out.recent_unlocks = table(recent, [
-          ['date', a => ts(a.DateAwarded)],
-          ['game_id', a => a.GameID],
-          ['game', a => a.GameTitle],
-          ['id', a => a.ID],
-          ['title', a => a.Title],
-          ['points', a => num(a.Points)],
-          ['hc', a => (num(a.HardcoreAchieved) ? true : undefined)],
-          ['type', a => a.Type ?? undefined],
-        ]);
+        out.recent_unlocks = {
+          games: gameTitles(
+            recent,
+            a => a.GameID,
+            a => a.GameTitle,
+          ),
+          ...table(recent, [
+            ['date', a => ts(a.DateAwarded)],
+            ['game_id', a => a.GameID],
+            ['id', a => a.ID],
+            ['title', a => a.Title],
+            ['points', a => num(a.Points)],
+            ['hc', a => flag(num(a.HardcoreAchieved) ? 1 : 0)],
+            ['type', a => a.Type ?? undefined],
+          ]),
+        };
       }
 
       if (awards) {
@@ -428,20 +449,18 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
     'get_user_unlocks',
     {
       description:
-        "A user's achievement unlocks, newest first. Give one of minutes, from/to, or date (default: last 24h).",
-      inputSchema: z.object({
-        user: userParam,
-        minutes: z.number().int().min(1).max(43200).optional().describe('Look back N minutes'),
-        from: z.string().optional().describe('Range start, ISO date/datetime (UTC)'),
-        to: z.string().optional().describe('Range end (default now)'),
-        date: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD')
-          .optional()
-          .describe('Single day, YYYY-MM-DD'),
-        hardcore_only: z.boolean().default(false).describe('Hardcore unlocks only'),
-        limit: limitParam(50, 500),
-      }),
+        "User's unlocks, newest first. One of minutes, from[/to], date; default last 24h.",
+      inputSchema: lean(
+        z.object({
+          user: userParam,
+          minutes: z.number().int().min(1).max(43200).optional(),
+          from: z.string().max(40).optional().describe('ISO date/datetime, UTC'),
+          to: z.string().max(40).optional().describe('Default now'),
+          date: z.string().max(10).optional().describe('YYYY-MM-DD'),
+          hardcore_only: z.boolean().default(false),
+          limit: limitParam(50, 500),
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -449,7 +468,11 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
       'get_user_unlocks',
       async ({ user, minutes, from, to, date, hardcore_only, limit }) => {
         const u = resolveUser(ctx, user);
-        const modes = [minutes !== undefined, from !== undefined || to !== undefined, !!date];
+        const modes = [
+          minutes !== undefined,
+          from !== undefined || to !== undefined,
+          date !== undefined,
+        ];
         if (modes.filter(Boolean).length > 1) {
           throw new ToolInputError('Give only one of "minutes", "from"/"to", or "date".');
         }
@@ -461,7 +484,9 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         let rows: RawUnlock[] | null;
         if (from !== undefined) {
           const f = epoch(from, 'from');
-          const t = to !== undefined ? epoch(to, 'to', true) : now;
+          // Open-ended range: "now" rounded UP to the minute, so repeat calls within a
+          // minute share one cache key instead of each missing on a new second.
+          const t = to !== undefined ? epoch(to, 'to', true) : Math.ceil(now / 60) * 60;
           if (t < f) throw new ToolInputError('"to" is before "from".');
           // A range that closed more than a day ago can no longer change.
           const ttl = t < now - 86400 ? TTL.game : TTL.user;
@@ -470,7 +495,10 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
             { u, f, t },
             ttl,
           );
-        } else if (date) {
+        } else if (date !== undefined) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+            throw new ToolInputError('"date" must be YYYY-MM-DD');
+          }
           const ttl = epoch(date, 'date', true) < now - 86400 ? TTL.game : TTL.user;
           rows = await ctx.client.get<RawUnlock[] | null>(
             'GetAchievementsEarnedOnDay',
@@ -490,21 +518,26 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           .filter(r => !hardcore_only || num(r.HardcoreMode) === 1)
           .sort((a, b) => (a.Date < b.Date ? 1 : a.Date > b.Date ? -1 : 0));
         const page = paginate(all, 0, limit);
+        const truncated = page.meta.next_offset !== undefined;
         return {
           count: all.length,
           points: all.reduce((s, r) => s + (num(r.Points) ?? 0), 0),
-          games: new Set(all.map(r => r.GameID)).size,
+          ...(truncated ? { game_count: new Set(all.map(r => r.GameID)).size } : {}),
+          games: gameTitles(
+            page.items,
+            r => r.GameID,
+            r => r.GameTitle,
+          ),
           ...table(page.items, [
             ['date', r => ts(r.Date)],
             ['game_id', r => r.GameID],
-            ['game', r => r.GameTitle],
             ['id', r => r.AchievementID],
             ['title', r => r.Title],
             ['points', r => num(r.Points)],
-            ['hc', r => (hardcore_only ? undefined : num(r.HardcoreMode) === 1)],
+            ['hc', r => (hardcore_only ? undefined : flag(num(r.HardcoreMode)))],
             ['type', r => r.Type ?? undefined],
           ]),
-          ...(page.meta.next_offset !== undefined ? { truncated: true } : {}),
+          ...(truncated ? { truncated: true } : {}),
         };
       },
     ),
@@ -514,20 +547,22 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
     'get_user_games',
     {
       description:
-        "A user's game lists: recently played, per-game completion progress (with award), 100%-completed, or want-to-play.",
-      inputSchema: z.object({
-        user: userParam,
-        list: z.enum(['recent', 'progress', 'completed', 'want_to_play']),
-        status: z
-          .enum(['mastered', 'beaten', 'in_progress', 'unfinished'])
-          .optional()
-          .describe('progress only: beaten incl. mastered; in_progress = no award'),
-        console_id: z.number().int().positive().optional().describe('Filter by console'),
-        sort: z.enum(['recent', 'title', 'percent']).default('recent').describe('progress only'),
-        images: z.boolean().default(false).describe('Include icon URLs'),
-        limit: limitParam(25, 500),
-        offset: offsetParam,
-      }),
+        "User's game lists: recent, progress (per-game counts + award), completed (100%), want_to_play.",
+      inputSchema: lean(
+        z.object({
+          user: userParam,
+          list: z.enum(['recent', 'progress', 'completed', 'want_to_play']),
+          status: z
+            .enum(['mastered', 'beaten', 'in_progress', 'unfinished'])
+            .optional()
+            .describe('progress only; beaten includes mastered; in_progress = no award'),
+          console_id: z.number().int().positive().optional(),
+          sort: z.enum(['recent', 'title', 'percent']).default('recent').describe('progress only'),
+          images: imagesParam,
+          limit: limitParam(25, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -544,13 +579,14 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           if (console_id !== undefined) {
             throw new ToolInputError('"console_id" is not supported for list="recent".');
           }
-          const c = Math.min(limit, 50); // upstream max
-          const rows =
+          const c = pageBucket(limit, 50); // upstream max 50; bucketed, sliced here
+          const raw =
             (await ctx.client.get<RawRecentGame[] | null>(
               'GetUserRecentlyPlayedGames',
               { u, c, o: offset },
               TTL.user,
             )) ?? [];
+          const rows = raw.slice(0, limit);
           const anyHc = rows.some(g => num(g.NumAchievedHardcore));
           return {
             ...table(rows, [
@@ -566,7 +602,7 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
               ['max_points', g => num(g.PossibleScore)],
               ['icon', g => icon(g.ImageIcon)],
             ]),
-            ...upstreamMeta(offset, rows.length, c),
+            ...upstreamMeta(offset, rows.length, limit, undefined, raw.length),
           };
         }
 
@@ -600,6 +636,8 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
               }
             });
             const frac = (g: RawCompletion) => (num(g.NumAwarded) ?? 0) / (num(g.MaxPossible) || 1);
+            // fetchAll's array is our own, but its rows are shared cache values: sorting
+            // the array is fine, mutating a row would not be.
             if (sort === 'title') all.sort((a, b) => a.Title.localeCompare(b.Title));
             if (sort === 'percent') all.sort((a, b) => frac(b) - frac(a));
             const page = paginate(all, offset, limit);
@@ -608,10 +646,10 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           } else {
             const r = await ctx.client.get<Paged<RawCompletion> | null>(
               'GetUserCompletionProgress',
-              { u, c: limit, o: offset },
+              { u, c: pageBucket(limit), o: offset },
               TTL.user,
             );
-            rows = r?.Results ?? [];
+            rows = (r?.Results ?? []).slice(0, limit);
             meta = upstreamMeta(offset, rows.length, limit, num(r?.Total));
           }
           const anyHc = rows.some(g => num(g.NumAwardedHardcore));
@@ -657,7 +695,7 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
               ['title', x => x.g.Title],
               ['console', x => (console_id !== undefined ? undefined : x.g.ConsoleName)],
               ['achievements', x => num(x.g.MaxPossible)],
-              ['hardcore', x => x.hc],
+              ['hardcore', x => flag(x.hc)],
               ['icon', x => icon(x.g.ImageIcon)],
             ]),
             ...page.meta,
@@ -669,7 +707,7 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         let meta: Record<string, number>;
         if (console_id !== undefined) {
           const all = (
-            await fetchAll<RawWantToPlay>(ctx, 'GetUserWantToPlayList', { u }, TTL.user)
+            await fetchAll<RawWantToPlay>(ctx, 'GetUserWantToPlayList', { u }, TTL.social)
           ).filter(g => g.ConsoleID === console_id);
           const page = paginate(all, offset, limit);
           rows = page.items;
@@ -677,10 +715,10 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         } else {
           const r = await ctx.client.get<Paged<RawWantToPlay> | null>(
             'GetUserWantToPlayList',
-            { u, c: limit, o: offset },
-            TTL.user,
+            { u, c: pageBucket(limit), o: offset },
+            TTL.social,
           );
-          rows = r?.Results ?? [];
+          rows = (r?.Results ?? []).slice(0, limit);
           meta = upstreamMeta(offset, rows.length, limit, num(r?.Total));
         }
         return {
@@ -702,31 +740,44 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
     'get_user_game_progress',
     {
       description:
-        "A user's progress in one game (summary + achievements with rarity), or a summary row per game for game_ids.",
-      inputSchema: z.object({
-        user: userParam,
-        game_id: z.number().int().positive().optional().describe('Game ID'),
-        game_ids: z
-          .array(z.number().int().positive())
-          .min(1)
-          .max(50)
-          .optional()
-          .describe('Several games, summary only'),
-        achievements: z
-          .enum(['locked', 'unlocked', 'all', 'none'])
-          .default('locked')
-          .describe('Which achievements to list'),
-        include_rank: z.boolean().default(false).describe("Add user's rank in this game"),
-        images: z.boolean().default(false).describe('Include image URLs'),
-        limit: limitParam(100, 500),
-        offset: offsetParam,
-      }),
+        "User's progress in one game (summary + achievements with rarity %), or one summary row per game_ids entry.",
+      inputSchema: lean(
+        z.object({
+          user: userParam,
+          game_id: z.number().int().positive().optional(),
+          game_ids: z
+            .array(z.number().int().positive())
+            .min(1)
+            .max(50)
+            .optional()
+            .describe('Summary only'),
+          achievements: z.enum(['locked', 'unlocked', 'all', 'none']).default('locked'),
+          sort: z
+            .enum(['display', 'rarity'])
+            .default('display')
+            .describe('rarity: most-earned first'),
+          include_rank: z.boolean().default(false),
+          images: imagesParam,
+          limit: limitParam(50, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
       ctx,
       'get_user_game_progress',
-      async ({ user, game_id, game_ids, achievements, include_rank, images, limit, offset }) => {
+      async ({
+        user,
+        game_id,
+        game_ids,
+        achievements,
+        sort,
+        include_rank,
+        images,
+        limit,
+        offset,
+      }) => {
         const u = resolveUser(ctx, user);
         if ((game_id === undefined) === (game_ids === undefined)) {
           throw new ToolInputError('Give exactly one of "game_id" or "game_ids".');
@@ -734,7 +785,8 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
 
         if (game_ids) {
           if (include_rank) throw new ToolInputError('"include_rank" needs "game_id".');
-          const ids = [...new Set(game_ids)];
+          // Sorted so the same set in any order shares one cache entry.
+          const ids = [...new Set(game_ids)].sort((a, b) => a - b);
           const r =
             (await ctx.client.get<Record<string, RawUserProgress> | null>(
               'GetUserProgress',
@@ -745,10 +797,10 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           return table(ids, [
             ['id', id => id],
             ['earned', id => num(r[id]?.NumAchieved)],
-            ['earned_hc', id => num(r[id]?.NumAchievedHardcore)],
+            ['earned_hc', id => num(r[id]?.NumAchievedHardcore) || undefined],
             ['total', id => num(r[id]?.NumPossibleAchievements)],
             ['points', id => num(r[id]?.ScoreAchieved)],
-            ['points_hc', id => num(r[id]?.ScoreAchievedHardcore)],
+            ['points_hc', id => num(r[id]?.ScoreAchievedHardcore) || undefined],
             ['max_points', id => num(r[id]?.PossibleScore)],
           ]);
         }
@@ -770,7 +822,8 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         ]);
         if (!p?.ID) return null;
 
-        const achs = Object.values(p.Achievements ?? {}).sort(
+        // Object.values/spread give a fresh array: upstream bodies are frozen cache values.
+        const achs = [...Object.values(p.Achievements ?? {})].sort(
           (a, b) => (a.DisplayOrder ?? 0) - (b.DisplayOrder ?? 0) || a.ID - b.ID,
         );
         const sum = (xs: RawProgressAch[]) => xs.reduce((s, a) => s + (num(a.Points) ?? 0), 0);
@@ -783,12 +836,17 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           console: p.ConsoleName,
           parent_game_id: p.ParentGameID ?? undefined,
           earned: num(p.NumAwardedToUser),
-          earned_hc: num(p.NumAwardedToUserHardcore),
           total: num(p.NumAchievements),
           pct: pct(p.UserCompletion),
-          pct_hc: pct(p.UserCompletionHardcore),
           points: sum(earned),
-          points_hc: sum(achs.filter(a => a.DateEarnedHardcore)),
+          // Hardcore figures only when there is hardcore progress (else all zeros).
+          ...(num(p.NumAwardedToUserHardcore)
+            ? {
+                earned_hc: num(p.NumAwardedToUserHardcore),
+                pct_hc: pct(p.UserCompletionHardcore),
+                points_hc: sum(achs.filter(a => a.DateEarnedHardcore)),
+              }
+            : {}),
           max_points: sum(achs),
           award: awardKind(p.HighestAwardKind),
           award_date: ts(p.HighestAwardDate)?.slice(0, 10),
@@ -810,6 +868,9 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
             const has = !!(a.DateEarned || a.DateEarnedHardcore);
             return achievements === 'all' || (achievements === 'unlocked' ? has : !has);
           });
+          // Stable sort keeps display order among equals.
+          if (sort === 'rarity')
+            rows.sort((a, b) => (num(b.NumAwarded) ?? 0) - (num(a.NumAwarded) ?? 0));
           const page = paginate(rows, offset, limit);
           out.achievements = {
             ...table(page.items, [
@@ -820,7 +881,7 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
               ['type', a => a.Type ?? a.type ?? undefined],
               ['rarity', a => rarity(a.NumAwarded, players)],
               ['earned', a => ts(a.DateEarned ?? a.DateEarnedHardcore)],
-              ['hc', a => (a.DateEarnedHardcore ? true : undefined)],
+              ['hc', a => flag(!!a.DateEarnedHardcore)],
               [
                 'badge',
                 a =>
@@ -841,17 +902,21 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
     'get_user_social',
     {
       description:
-        "A user's set requests or dev claims, or who the API-key owner follows / is followed by (following/followers ignore user).",
-      inputSchema: z.object({
-        user: userParam,
-        kind: z.enum(['following', 'followers', 'set_requests', 'claims']),
-        all_requests: z.boolean().default(false).describe('set_requests: include fulfilled'),
-        limit: limitParam(50, 500),
-        offset: offsetParam,
-      }),
+        "User's set requests or dev claims; or who the API-key owner follows / is followed by (ignores user).",
+      inputSchema: lean(
+        z.object({
+          user: userParam,
+          kind: z.enum(['following', 'followers', 'set_requests', 'claims']),
+          all_requests: z.boolean().default(false).describe('set_requests: include fulfilled'),
+          // Per-kind default (claims 20, else 50), so no schema default.
+          limit: z.number().int().min(1).max(500).optional(),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
-    handler(ctx, 'get_user_social', async ({ user, kind, all_requests, limit, offset }) => {
+    handler(ctx, 'get_user_social', async ({ user, kind, all_requests, limit: lim, offset }) => {
+      const limit = lim ?? (kind === 'claims' ? 20 : 50);
       if (kind === 'following' || kind === 'followers') {
         // These endpoints take no user: they always describe the API-key owner.
         if (user !== undefined && user !== ctx.defaultUser) {
@@ -862,16 +927,16 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
         const following = kind === 'following';
         const r = await ctx.client.get<Paged<RawFollow> | null>(
           following ? 'GetUsersIFollow' : 'GetUsersFollowingMe',
-          { c: limit, o: offset },
-          TTL.user,
+          { c: pageBucket(limit), o: offset },
+          TTL.social,
         );
-        const rows = r?.Results ?? [];
+        const rows = (r?.Results ?? []).slice(0, limit);
         return {
           ...table(rows, [
             ['user', f => f.User],
             ['points', f => num(f.Points)],
             ['softcore_points', f => num(f.PointsSoftcore)],
-            ['mutual', f => (following ? f.IsFollowingMe : f.AmIFollowing)],
+            ['mutual', f => flag(following ? f.IsFollowingMe : f.AmIFollowing)],
           ]),
           ...upstreamMeta(offset, rows.length, limit, num(r?.Total)),
         };
@@ -909,7 +974,7 @@ export function registerUserTools(server: McpServer, ctx: ToolContext): void {
           ['console', c => c.ConsoleName],
           ['status', c => CLAIM_STATUS[c.Status ?? -1] ?? c.Status],
           ['set', c => (c.SetType === 1 ? 'revision' : 'new')],
-          ['collab', c => (c.ClaimType === 1 ? true : undefined)],
+          ['collab', c => flag(c.ClaimType === 1)],
           ['special', c => CLAIM_SPECIAL[c.Special ?? 0]],
           ['created', c => ts(c.Created)?.slice(0, 10)],
           // DoneTime = expiry for active claims, completion/drop time otherwise.

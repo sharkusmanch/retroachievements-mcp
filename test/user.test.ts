@@ -6,6 +6,7 @@ import { TTL, type Params, type RAClient } from '../src/client.js';
 import type { CatalogStore } from '../src/catalog.js';
 import type { ToolContext } from '../src/tools/common.js';
 import { registerUserTools } from '../src/tools/user.js';
+import { frozen } from './helpers.js';
 
 // ---------- fixtures (trimmed from real responses, 2026-09) ----------
 
@@ -349,7 +350,7 @@ async function setup(defaultUser: string | null = 'marcus1255') {
   get = vi.fn((endpoint: string, params: Params) => {
     const h = routes[endpoint];
     if (!h) throw new Error(`unexpected endpoint ${endpoint}`);
-    return Promise.resolve(h(params));
+    return Promise.resolve(h(params)).then(frozen);
   });
   const ctx: ToolContext = {
     client: { get } as unknown as RAClient,
@@ -375,7 +376,8 @@ async function call(name: string, args: Record<string, unknown>) {
 /** Rows of a table as keyed objects, for readable assertions. */
 function rowsOf(value: unknown) {
   const t = value as { cols: string[]; rows: unknown[][] };
-  return t.rows.map(r => Object.fromEntries(t.cols.map((c, i) => [c, r[i]])));
+  // Rows may omit trailing empty cells; read those back as null.
+  return t.rows.map(r => Object.fromEntries(t.cols.map((c, i) => [c, r[i] ?? null])));
 }
 
 beforeEach(async () => {
@@ -413,7 +415,6 @@ describe('get_user_profile', () => {
     expect(get).toHaveBeenCalledTimes(1);
     expect(r.json()).toEqual({
       user: 'marcus1255',
-      ulid: '01B8KEV961X1RR8V29D0627GY4',
       member_since: '2017-02-10',
       points: 27,
       softcore_points: 206,
@@ -422,6 +423,13 @@ describe('get_user_profile', () => {
       last_game_id: 765,
     });
     expect(r.text).not.toContain('UserPic');
+  });
+
+  it('includes the ULID only when the input was a ULID', async () => {
+    routes.GetUserProfile = () => PROFILE;
+    const j = (await call('get_user_profile', { user: '01B8KEV961X1RR8V29D0627GY4' })).json();
+    expect(j.ulid).toBe('01B8KEV961X1RR8V29D0627GY4');
+    expect(j.user).toBe('marcus1255');
   });
 
   it('uses GetUserSummary alone for summary and flattens recent unlocks newest first', async () => {
@@ -452,6 +460,9 @@ describe('get_user_profile', () => {
     const unlocks = rowsOf(j.recent_unlocks);
     expect(unlocks.map(u => u.id)).toEqual([179024, 179023]);
     expect(j.recent_unlocks.cols).not.toContain('hc');
+    // Game titles hoisted into a map, not repeated per row.
+    expect(j.recent_unlocks.games).toEqual({ '765': 'Final Fantasy VI: Advance' });
+    expect(j.recent_unlocks.cols).not.toContain('game');
     expect(r.text).not.toContain('ForumTopicID');
   });
 
@@ -459,7 +470,7 @@ describe('get_user_profile', () => {
     routes.GetUserProfile = () => PROFILE;
     routes.GetUserAwards = () => AWARDS;
     const j = (await call('get_user_profile', { include: ['awards'] })).json();
-    expect(get).toHaveBeenCalledWith('GetUserAwards', { u: 'marcus1255' }, TTL.user);
+    expect(get).toHaveBeenCalledWith('GetUserAwards', { u: 'marcus1255' }, TTL.social);
     expect(j.awards.total).toBe(2);
     expect(j.awards.beaten).toBe(1);
     expect(j.awards.site).toBe(1);
@@ -508,10 +519,11 @@ describe('get_user_unlocks', () => {
     );
     expect(j.count).toBe(2);
     expect(j.points).toBe(10);
-    expect(j.games).toBe(1);
-    expect(j.cols).toEqual(['date', 'game_id', 'game', 'id', 'title', 'points', 'hc', 'type']);
-    expect(rowsOf(j)[0]).toMatchObject({ date: '2026-09-29 22:24', id: 179024, hc: true });
-    expect(rowsOf(j)[1]).toMatchObject({ id: 179023, hc: false });
+    expect(j.games).toEqual({ '765': 'Final Fantasy VI: Advance' });
+    expect(j.game_count).toBeUndefined();
+    expect(j.cols).toEqual(['date', 'game_id', 'id', 'title', 'points', 'hc', 'type']);
+    expect(rowsOf(j)[0]).toMatchObject({ date: '2026-09-29 22:24', id: 179024, hc: 1 });
+    expect(rowsOf(j)[1]).toMatchObject({ id: 179023, hc: null });
   });
 
   it('passes minutes through', async () => {
@@ -536,6 +548,36 @@ describe('get_user_unlocks', () => {
       },
       TTL.game,
     );
+  });
+
+  it('open-ended from: "to" is now rounded up to the minute (stable cache key)', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.UTC(2026, 8, 29, 12, 30, 10));
+      routes.GetAchievementsEarnedBetween = () => [];
+      await call('get_user_unlocks', { from: '2026-09-29T00:00Z' });
+      vi.setSystemTime(Date.UTC(2026, 8, 29, 12, 30, 50));
+      await call('get_user_unlocks', { from: '2026-09-29T00:00Z' });
+      const ts = get.mock.calls.map(c => (c[1] as { t: number }).t);
+      expect(ts).toEqual([
+        Date.UTC(2026, 8, 29, 12, 31) / 1000,
+        Date.UTC(2026, 8, 29, 12, 31) / 1000,
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['2026-09-01T10:15', Date.UTC(2026, 8, 1, 10, 15)],
+    ['2026-09-01 10:15:30', Date.UTC(2026, 8, 1, 10, 15, 30)],
+    ['2026-09-01T10:15:30.5Z', Date.UTC(2026, 8, 1, 10, 15, 30)],
+    ['2026-09-01T10:15+02:00', Date.UTC(2026, 8, 1, 8, 15)],
+    ['2026-09-01T10:15-0130', Date.UTC(2026, 8, 1, 11, 45)],
+  ])('accepts ISO from %s', async (from, ms) => {
+    routes.GetAchievementsEarnedBetween = () => [];
+    await call('get_user_unlocks', { from, to: '2026-09-30' });
+    expect((get.mock.calls[0]?.[1] as { f: number }).f).toBe(Math.floor(ms / 1000));
   });
 
   it('uses GetAchievementsEarnedOnDay for date and filters hardcore', async () => {
@@ -563,6 +605,12 @@ describe('get_user_unlocks', () => {
     [{ from: '2026-09-02', to: '2026-09-01' }, /before/],
     [{ minutes: 50000 }, /./],
     [{ date: '29/09/2026' }, /./],
+    [{ date: '2026-02-30' }, /./],
+    [{ from: '2026-02-30' }, /ISO date/],
+    [{ from: '2026-13-01' }, /ISO date/],
+    [{ from: 'Sep 5 2026' }, /ISO date/],
+    [{ from: '2026-09-01T25:00' }, /ISO date/],
+    [{ from: '2026-09-01', to: '2026-04-31' }, /ISO date/],
   ])('rejects %j', async (args, msg) => {
     const r = await call('get_user_unlocks', args);
     expect(r.isError).toBe(true);
@@ -599,9 +647,10 @@ describe('get_user_games', () => {
     const j = (await call('get_user_games', { list: 'progress', limit: 3 })).json();
     expect(get).toHaveBeenCalledWith(
       'GetUserCompletionProgress',
-      { u: 'marcus1255', c: 3, o: 0 },
+      { u: 'marcus1255', c: 25, o: 0 },
       TTL.user,
     );
+    expect(j.rows).toHaveLength(3);
     expect(j.total).toBe(40);
     expect(j.next_offset).toBe(3);
     expect(rowsOf(j)[1]).toMatchObject({ id: 668, award: 'mastered', award_date: '2024-07-29' });
@@ -651,7 +700,7 @@ describe('get_user_games', () => {
         title: 'Sonic the Hedgehog',
         console: 'Genesis/Mega Drive',
         achievements: 35,
-        hardcore: true,
+        hardcore: 1,
       },
     ]);
   });
@@ -676,7 +725,7 @@ describe('get_user_games', () => {
     expect(get).toHaveBeenCalledWith(
       'GetUserWantToPlayList',
       { u: 'marcus1255', c: 25, o: 0 },
-      TTL.user,
+      TTL.social,
     );
     expect(rowsOf(j)[0]).toMatchObject({
       id: 5853,
@@ -742,9 +791,34 @@ describe('get_user_game_progress', () => {
       await call('get_user_game_progress', { game_id: 765, achievements: 'unlocked' })
     ).json();
     expect(rowsOf(j.achievements)).toEqual([
-      expect.objectContaining({ id: 1, rarity: 50, earned: '2026-09-29 21:27', hc: true }),
+      expect.objectContaining({ id: 1, rarity: 50, earned: '2026-09-29 21:27', hc: 1 }),
       expect.objectContaining({ id: 2, rarity: 6.2, earned: '2026-09-29 22:24', hc: null }),
     ]);
+  });
+
+  it('sort=rarity lists most-earned first; default limit is 50', async () => {
+    routes.GetGameInfoAndUserProgress = () => GAME_PROGRESS;
+    const j = (
+      await call('get_user_game_progress', { game_id: 765, achievements: 'all', sort: 'rarity' })
+    ).json();
+    expect(rowsOf(j.achievements).map(r => r.id)).toEqual([1, 3, 2]);
+    const { tools } = await client.listTools();
+    const t = tools.find(x => x.name === 'get_user_game_progress');
+    expect((t?.inputSchema.properties?.limit as { default?: number }).default).toBe(50);
+  });
+
+  it('drops the hardcore summary fields when there is no hardcore progress', async () => {
+    routes.GetGameInfoAndUserProgress = () => ({
+      ...GAME_PROGRESS,
+      NumAwardedToUserHardcore: 0,
+      UserCompletionHardcore: '0.00%',
+      Achievements: { '2': ach(2, 2, 123, '2026-09-29 22:24:37') },
+    });
+    const j = (await call('get_user_game_progress', { game_id: 765, achievements: 'none' })).json();
+    expect(j.earned).toBe(2);
+    expect(j).not.toHaveProperty('earned_hc');
+    expect(j).not.toHaveProperty('pct_hc');
+    expect(j).not.toHaveProperty('points_hc');
   });
 
   it('all + limit paginates; none omits the table', async () => {
@@ -785,17 +859,17 @@ describe('get_user_game_progress', () => {
   it('game_ids: one summary row per game via GetUserProgress', async () => {
     routes.GetUserProgress = () => USER_PROGRESS;
     const j = (await call('get_user_game_progress', { game_ids: [765, 765, 1] })).json();
-    expect(get).toHaveBeenCalledWith('GetUserProgress', { u: 'marcus1255', i: '765,1' }, TTL.user);
-    expect(rowsOf(j)[0]).toEqual({
+    // Sorted + deduped, so any order of the same set shares one cache entry.
+    expect(get).toHaveBeenCalledWith('GetUserProgress', { u: 'marcus1255', i: '1,765' }, TTL.user);
+    expect(j.cols).not.toContain('earned_hc'); // all-zero hardcore columns drop
+    expect(rowsOf(j)[1]).toEqual({
       id: 765,
       earned: 2,
-      earned_hc: 0,
       total: 85,
       points: 10,
-      points_hc: 0,
       max_points: 576,
     });
-    expect(rowsOf(j)[1]).toMatchObject({ id: 1, earned: null });
+    expect(rowsOf(j)[0]).toMatchObject({ id: 1, earned: null });
   });
 
   it.each([
@@ -820,9 +894,9 @@ describe('get_user_social', () => {
       ],
     });
     const j = (await call('get_user_social', { kind: 'following', limit: 1 })).json();
-    expect(get).toHaveBeenCalledWith('GetUsersIFollow', { c: 1, o: 0 }, TTL.user);
+    expect(get).toHaveBeenCalledWith('GetUsersIFollow', { c: 25, o: 0 }, TTL.social);
     expect(rowsOf(j)).toEqual([
-      { user: 'zuliman92', points: 1882, softcore_points: 258, mutual: true },
+      { user: 'zuliman92', points: 1882, softcore_points: 258, mutual: 1 },
     ]);
     expect(j.total).toBe(3);
     expect(j.next_offset).toBe(1);
@@ -856,6 +930,23 @@ describe('get_user_social', () => {
     ]);
   });
 
+  it('claims default to 20 rows; other kinds to 50', async () => {
+    const many = Array.from({ length: 60 }, (_, i) => ({
+      ...CLAIMS[0],
+      GameID: i + 1,
+      Created: `2026-01-${String((i % 28) + 1).padStart(2, '0')} 00:00:00`,
+    }));
+    routes.GetUserClaims = () => many;
+    const j = (await call('get_user_social', { kind: 'claims' })).json();
+    expect(j.rows).toHaveLength(20);
+    expect(j.next_offset).toBe(20);
+    routes.GetUserSetRequests = () => ({
+      RequestedSets: many.map(c => ({ GameID: c.GameID, Title: 't' })),
+    });
+    const r = (await call('get_user_social', { kind: 'set_requests' })).json();
+    expect(r.rows).toHaveLength(50);
+  });
+
   it('claims: newest first with decoded enums', async () => {
     routes.GetUserClaims = () => CLAIMS;
     const j = (await call('get_user_social', { kind: 'claims', user: 'Jamiras' })).json();
@@ -867,7 +958,7 @@ describe('get_user_social', () => {
         console: 'Famicom Disk System',
         status: 'active',
         set: 'new',
-        collab: true,
+        collab: 1,
         special: 'free_rollout',
         created: '2026-09-12',
         done: '2026-12-12',

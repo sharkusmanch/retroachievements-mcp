@@ -139,9 +139,52 @@ describe('/mcp guards', () => {
     expect(res.status).toBe(200);
   });
 
-  it('warns at startup when the allowlist is empty', async () => {
-    const { lines } = await start();
+  it('empty allowlist = localhost only (DNS-rebinding protection on loopback)', async () => {
+    const { base, lines } = await start();
+    expect(lines.some(l => l.includes('DISABLED'))).toBe(false);
+    const post = (host: string) =>
+      rawRequest(base, '/mcp', {
+        method: 'POST',
+        headers: { ...mcpHeaders, host },
+        body: JSON.stringify(INIT),
+      });
+    expect((await post('evil.test')).status).toBe(403);
+    expect((await post('attacker.example:8080')).status).toBe(403);
+    for (const host of ['localhost:8080', '127.0.0.1:8080', '[::1]:8080']) {
+      expect((await post(host)).status).toBe(200);
+    }
+  });
+
+  it('MCP_ALLOWED_HOSTS=* disables the check, with a warning', async () => {
+    const { base, lines } = await start({ MCP_ALLOWED_HOSTS: ['*'] });
     expect(lines.some(l => l.includes('host header validation is DISABLED'))).toBe(true);
+    const res = await rawRequest(base, '/mcp', {
+      method: 'POST',
+      headers: { ...mcpHeaders, host: 'evil.test' },
+      body: JSON.stringify(INIT),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('oversized body → 413 JSON-RPC error, not a parse error', async () => {
+    const { base } = await start();
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({ ...INIT, pad: 'x'.repeat(300 * 1024) }),
+    });
+    expect(res.status).toBe(413);
+    expect(await res.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32600 } });
+  });
+
+  it.each(['bearer', 'BEARER', 'Bearer  '])('accepts the %j scheme case-insensitively', async s => {
+    const { base } = await start({ MCP_AUTH_TOKEN: TOKEN });
+    const res = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { ...mcpHeaders, authorization: `${s.trim()} ${TOKEN}` },
+      body: JSON.stringify(INIT),
+    });
+    expect(res.status).toBe(200);
   });
 
   it.each([

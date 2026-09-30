@@ -6,6 +6,7 @@ import {
   bool,
   clean,
   fail,
+  flag,
   imageUrl,
   num,
   ok,
@@ -119,7 +120,7 @@ describe('table', () => {
     ['flag', r => r.flag],
   ];
 
-  it('drops columns empty on every row and fills remaining gaps with null', () => {
+  it('drops columns empty on every row, nulls interior gaps, trims trailing ones', () => {
     const t = table<Row>(
       [
         { id: 1, name: 'a', hc: '', zero: 0 },
@@ -129,7 +130,7 @@ describe('table', () => {
     );
     expect(t.cols).toEqual(['id', 'name', 'zero', 'flag']);
     expect(t.rows).toEqual([
-      [1, 'a', 0, null],
+      [1, 'a', 0],
       [2, null, 0, false],
     ]);
   });
@@ -144,9 +145,22 @@ describe('table', () => {
     expect(table<Row>([], cols)).toEqual({ cols: [], rows: [] });
   });
 
-  it('every row has the same arity as cols', () => {
-    const t = table<Row>([{ id: 1 }, { id: 2, name: 'b' }, { id: 3, hc: 'x', flag: true }], cols);
-    for (const r of t.rows) expect(r).toHaveLength(t.cols.length);
+  it('moves mostly-empty columns last (most-filled first) and trims trailing nulls', () => {
+    const t = table<Row>(
+      [{ id: 1 }, { id: 2, name: 'b' }, { id: 3, hc: 'x', flag: true }, { id: 4, flag: true }],
+      cols,
+    );
+    // flag is on 2/4 rows (dense); name and hc on 1/4 each (sparse, original order).
+    expect(t.cols).toEqual(['id', 'flag', 'name', 'hc']);
+    expect(t.rows).toEqual([[1], [2, null, 'b'], [3, true, null, 'x'], [4, true]]);
+    for (const r of t.rows) expect(r.length).toBeLessThanOrEqual(t.cols.length);
+  });
+});
+
+describe('flag', () => {
+  it('true/1/"1" → 1; anything else omitted', () => {
+    expect([true, 1, '1'].map(flag)).toEqual([1, 1, 1]);
+    expect([false, 0, '0', null, undefined, 'yes'].map(flag)).toEqual(Array(6).fill(undefined));
   });
 });
 

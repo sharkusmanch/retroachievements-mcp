@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { RAClient, RAError, TTL, cacheKey } from '../src/client.js';
+import {
+  ENDPOINT_TTL,
+  RAClient,
+  RAError,
+  REQUEST_DEADLINE_MS,
+  TTL,
+  cacheKey,
+} from '../src/client.js';
 import { createLogger, registerSecret } from '../src/logger.js';
 
 const KEY = 'SuperSecretApiKey0123456789abcdef';
@@ -178,6 +185,49 @@ describe('cache', () => {
     await client.get('GetGame', { i: 'a' }, TTL.game);
     expect(fetchMock).toHaveBeenCalledTimes(3);
     await client.get('GetGame', { i: 'b' }, TTL.game);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('uses the per-endpoint default TTL when none is passed', async () => {
+    expect(ENDPOINT_TTL.GetUserAwards).toBe(600);
+    expect(ENDPOINT_TTL.GetGameProgression).toBeGreaterThanOrEqual(TTL.game);
+    expect(Object.keys(ENDPOINT_TTL)).toHaveLength(38);
+    vi.useFakeTimers();
+    const { client, fetchMock } = setup(() => Promise.resolve(json({ ok: 1 })));
+    await client.get('GetUserAwards', { u: 'x' });
+    vi.advanceTimersByTime(599_000);
+    await client.get('GetUserAwards', { u: 'x' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(2_000);
+    await client.get('GetUserAwards', { u: 'x' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Unknown endpoint → TTL.feed.
+    await client.get('GetSomethingNew', {});
+    vi.advanceTimersByTime(299_000);
+    await client.get('GetSomethingNew', {});
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('never caches a body over 1 MB', async () => {
+    const big = JSON.stringify({ x: 'y'.repeat(1024 * 1024) });
+    const { client, fetchMock } = setup(() => Promise.resolve(new Response(big)));
+    await client.get('GetGame', { i: 1 }, TTL.game);
+    await client.get('GetGame', { i: 1 }, TTL.game);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(client.cacheSize().entries).toBe(0);
+  });
+
+  it('evicts LRU entries to stay under RA_CACHE_MAX_BYTES', async () => {
+    const body = JSON.stringify({ x: 'y'.repeat(990) }); // ~1000 bytes
+    const { client, fetchMock } = setup(() => Promise.resolve(new Response(body)), {
+      RA_CACHE_MAX_BYTES: 2500,
+    });
+    for (const i of [1, 2, 3]) await client.get('GetGame', { i }, TTL.game);
+    expect(client.cacheSize().entries).toBe(2);
+    expect(client.cacheSize().bytes).toBeLessThanOrEqual(2500);
+    await client.get('GetGame', { i: 3 }, TTL.game); // still cached
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await client.get('GetGame', { i: 1 }, TTL.game); // evicted
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
@@ -391,6 +441,46 @@ describe('retry', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
+  it('a 429 pauses the shared bucket: queued requests wait out the window', async () => {
+    const { client, fetchMock } = setup(url =>
+      Promise.resolve(
+        url.searchParams.get('i') === '1' && fetchMock.mock.calls.length === 1
+          ? json({}, 429, { 'retry-after': '3' })
+          : json({ ok: 1 }),
+      ),
+    );
+    const a = client.get('GetGame', { i: 1 }, TTL.game);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const b = client.get('GetGame', { i: 2 }, TTL.game);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // b held by the cooldown
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // a's retry gets the single token
+    await vi.advanceTimersByTimeAsync(100); // then pacing resumes (600/min)
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(await a).toEqual({ ok: 1 });
+    expect(await b).toEqual({ ok: 1 });
+  });
+
+  it('stops retrying when the next attempt would pass the overall deadline', async () => {
+    const { client, fetchMock } = setup(
+      () =>
+        new Promise<Response>(r =>
+          setTimeout(() => r(json({ message: 'busy' }, 503, { 'retry-after': '10' })), 12_000),
+        ),
+      { RA_TIMEOUT_MS: 20_000 },
+    );
+    const p = client.get('GetGame', { i: 1 }, TTL.game).catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+    const err = (await p) as RAError;
+    expect(err.status).toBe(503);
+    expect(err.message).toBe('busy');
+    // 0→12s fail, wait 10 → 22→34s fail; 34+10 > 35 → give up.
+    expect(REQUEST_DEADLINE_MS).toBe(35_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it.each([400, 401, 403, 404, 422])('does not retry %i', async status => {
     const { client, fetchMock } = setup(() => Promise.resolve(json({}, status)));
     const p = client.get('GetGame', { i: 1 }, TTL.game).catch((e: unknown) => e);
@@ -413,10 +503,43 @@ describe('response handling', () => {
     expect(e.message).toMatch(/API key rejected/);
   });
 
-  it('404 → not found', async () => {
+  it('404 → not found (non-JSON body)', async () => {
     const e = await errOf(() => new Response('<html>nope</html>', { status: 404 }));
     expect(e.status).toBe(404);
     expect(e.message).toBe('not found');
+  });
+
+  it('404 with a JSON message → the body text', async () => {
+    const e = await errOf(() => json({ message: 'Game not found.' }, 404));
+    expect(e.message).toBe('Game not found.');
+  });
+
+  it('array-of-strings body → joined message (capped at 300)', async () => {
+    const e = await errOf(() => json(['User has no leaderboards on this game', 'second'], 422));
+    expect(e.message).toBe('User has no leaderboards on this game; second');
+    const long = await errOf(() => json(['a'.repeat(200), 'b'.repeat(200)], 422));
+    expect(long.message).toHaveLength(300);
+    const junk = await errOf(() => json([1, null], 422));
+    expect(junk.message).toBe('HTTP 422');
+  });
+
+  it('401 keeps its fixed text even with a body message', async () => {
+    const e = await errOf(() => json(['nope'], 401));
+    expect(e.message).toMatch(/API key rejected/);
+  });
+
+  it('deep-freezes parsed bodies (cache values are shared)', async () => {
+    const { client } = setup(() => Promise.resolve(json({ a: [{ b: 1 }], c: { d: [2, 1] } })));
+    const v = await client.get<{ a: { b: number }[]; c: { d: number[] } }>(
+      'GetGame',
+      { i: 1 },
+      TTL.game,
+    );
+    expect(Object.isFrozen(v)).toBe(true);
+    expect(Object.isFrozen(v.a[0])).toBe(true);
+    expect(() => v.c.d.sort()).toThrow(TypeError);
+    const again = await client.get<typeof v>('GetGame', { i: 1 }, TTL.game);
+    expect(again.c.d).toEqual([2, 1]);
   });
 
   it('422 → body message (truncated to 300 chars)', async () => {
@@ -494,6 +617,16 @@ describe('network errors and secret hygiene', () => {
     const err = (await p) as RAError;
     expect(err).toBeInstanceOf(RAError);
     expect(err.message).toBe('request timed out');
+  });
+
+  it('retries a timeout only once', async () => {
+    const { client, fetchMock } = setup(() =>
+      Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+    );
+    const p = client.get('GetGame', { i: 1 }, TTL.game).catch((e: unknown) => e);
+    await vi.runAllTimersAsync();
+    await p;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('recovers when a later attempt succeeds', async () => {

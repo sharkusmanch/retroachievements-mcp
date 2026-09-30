@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import express from 'express';
 import { hostHeaderValidation } from '@modelcontextprotocol/express';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { localhostAllowedHostnames } from '@modelcontextprotocol/server';
 import type { Config } from './config.js';
 import { createServer } from './server.js';
 import type { ToolContext } from './tools/common.js';
@@ -13,9 +14,11 @@ const rpcError = (code: number, message: string) => ({
   id: null,
 });
 
+/** RFC 7235: the auth scheme is case-insensitive. Token compare is timing-safe. */
 function bearerMatches(header: string | undefined, token: string): boolean {
-  if (!header?.startsWith('Bearer ')) return false;
-  const a = Buffer.from(header.slice(7));
+  const m = header ? /^bearer\s+/i.exec(header) : null;
+  if (!header || !m) return false;
+  const a = Buffer.from(header.slice(m[0].length));
   const b = Buffer.from(token);
   return a.length === b.length && timingSafeEqual(a, b);
 }
@@ -39,10 +42,14 @@ export function createApp(
     res.json({ status: 'ok', service: 'retroachievements-mcp', version: VERSION });
   });
 
-  if (cfg.MCP_ALLOWED_HOSTS.length > 0) {
-    app.use('/mcp', hostHeaderValidation(cfg.MCP_ALLOWED_HOSTS));
+  // DNS-rebinding protection. An empty allowlist only reaches here on a loopback bind
+  // (loadConfig refuses it otherwise), so it means "localhost only" — the SDK's list.
+  // `*` is the explicit, logged opt-out.
+  const hosts = cfg.MCP_ALLOWED_HOSTS;
+  if (hosts.includes('*')) {
+    log.warn('MCP_ALLOWED_HOSTS=* — host header validation is DISABLED for /mcp');
   } else {
-    log.warn('MCP_ALLOWED_HOSTS is empty — host header validation is DISABLED for /mcp');
+    app.use('/mcp', hostHeaderValidation(hosts.length > 0 ? hosts : localhostAllowedHostnames()));
   }
 
   const token = cfg.MCP_AUTH_TOKEN;
@@ -92,11 +99,18 @@ export function createApp(
   // Terminal error handler: keeps Express's HTML/stack output away from clients and logs.
   app.use(
     (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      log.error('unhandled request error', err);
       if (res.headersSent) {
+        log.error('unhandled request error', err);
         res.end();
         return;
       }
+      const e = (err ?? {}) as { type?: unknown; status?: unknown };
+      if (e.type === 'entity.too.large' || e.status === 413) {
+        log.warn('request body too large');
+        res.status(413).json(rpcError(-32600, 'Request body too large'));
+        return;
+      }
+      log.error('unhandled request error', err);
       res.status(400).json(rpcError(-32700, 'Parse error'));
     },
   );

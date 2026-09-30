@@ -6,6 +6,7 @@ import { TTL, type RAClient } from '../src/client.js';
 import type { CatalogStore } from '../src/catalog.js';
 import type { ToolContext } from '../src/tools/common.js';
 import { ENDPOINTS, clip, rawText, registerCommunityTools } from '../src/tools/community.js';
+import { frozen } from './helpers.js';
 
 // Fresh mock per test (mockReset() on a shared fn made vitest report a caught throw as a failure).
 let get = vi.fn();
@@ -13,7 +14,9 @@ const noop = () => undefined;
 
 async function connect(defaultUser: string | undefined = 'me') {
   const ctx: ToolContext = {
-    client: { get } as unknown as RAClient,
+    client: {
+      get: (...a: unknown[]) => Promise.resolve(get(...a) as unknown).then(frozen),
+    } as unknown as RAClient,
     catalog: {} as CatalogStore,
     log: { debug: noop, info: noop, warn: noop, error: noop },
     defaultUser,
@@ -87,10 +90,12 @@ describe('get_feed', () => {
       title: 'Ach',
       description: 'Do it',
       points: 3,
-      retro_points: 4,
+      retro: 4,
       type: 'progression',
       author: 'dev',
     });
+    expect(json.unlocks_hc).toBe(30);
+    expect(json.hardcore_unlocks).toBeUndefined();
     expect(json.game).toEqual({ id: 20, title: 'Game', console: 'PlayStation 2' });
     expect(json).toMatchObject({ start: '2026-09-28', players: 100, unlocks: 30, total: 30 });
     const recent = json.recent as { cols: string[]; rows: unknown[][] };
@@ -118,6 +123,35 @@ describe('get_feed', () => {
     expect(text.length).toBeLessThan(1200);
   });
 
+  it('recent_awards: award kinds use the shared short labels; date is checked', async () => {
+    get.mockResolvedValue({
+      Total: 2,
+      Results: [
+        {
+          User: 'u',
+          AwardKind: 'beaten-hardcore',
+          AwardDate: '2026-09-30',
+          GameID: 5,
+          GameTitle: 'G',
+          ConsoleName: 'NES',
+        },
+        {
+          User: 'v',
+          AwardKind: 'beaten-softcore',
+          AwardDate: '2026-09-30',
+          GameID: 6,
+          GameTitle: 'H',
+          ConsoleName: 'NES',
+        },
+      ],
+    });
+    const { json } = await call('get_feed', { kind: 'recent_awards' });
+    expect((json.rows as unknown[][]).map(r => r[2])).toEqual(['beaten_hc', 'beaten']);
+    const bad = await call('get_feed', { kind: 'recent_awards', date: '09/01/2026' });
+    expect(bad.isError).toBe(true);
+    expect(bad.text).toMatch(/YYYY-MM-DD/);
+  });
+
   it('top_users: positional keys → table with rank', async () => {
     get.mockResolvedValue([
       { '1': 'A', '2': 10, '3': 20, '4': 'ULID' },
@@ -125,7 +159,7 @@ describe('get_feed', () => {
     ]);
     const { json } = await call('get_feed', { kind: 'top_users' });
     expect(json).toEqual({
-      cols: ['rank', 'user', 'points', 'retro_points'],
+      cols: ['rank', 'user', 'points', 'retro'],
       rows: [
         [1, 'A', 10, 20],
         [2, 'B', 9, 19],
@@ -219,7 +253,7 @@ describe('get_feed', () => {
     get.mockResolvedValue([claim({ GameID: 7 }), claim({ GameID: 8 })]);
     const { json } = await call('get_feed', { kind: 'claims', claim_kind: 'dropped', game_id: 7 });
     expect(get).toHaveBeenCalledWith('GetClaims', { k: 2 }, TTL.feed);
-    expect(json.claim_kind).toBe('dropped');
+    expect(json.claim_kind).toBeUndefined(); // the caller's own input is not echoed
     expect(json.cols).toContain('ended');
     expect(json.rows).toHaveLength(1);
   });
@@ -272,7 +306,7 @@ describe('get_comments', () => {
     const { json, text } = await call('get_comments', { target: 'game', id: 5, limit: 3 });
     expect(get).toHaveBeenCalledWith(
       'GetComments',
-      { t: 1, i: 5, c: 3, o: undefined, sort: '-submitted' },
+      { t: 1, i: 5, c: 25, o: undefined, sort: '-submitted' },
       TTL.feed,
     );
     expect(json).toMatchObject({ total: 8, system_hidden: 1, next_offset: 3 });
@@ -295,7 +329,7 @@ describe('get_comments', () => {
     });
     expect(get).toHaveBeenCalledWith(
       'GetComments',
-      { t: 2, i: 9, c: 10, o: 5, sort: 'submitted' },
+      { t: 2, i: 9, c: 25, o: 5, sort: 'submitted' },
       TTL.feed,
     );
     expect(json.rows).toHaveLength(3);
@@ -355,7 +389,7 @@ describe('get_tickets', () => {
   it('recent: c/o upstream, compact rows with short note', async () => {
     get.mockResolvedValue({ RecentTickets: [ticket(2), ticket(1)], OpenTickets: 3934, URL: 'u' });
     const { json, text } = await call('get_tickets', { mode: 'recent', limit: 2, offset: 4 });
-    expect(get).toHaveBeenCalledWith('GetTicketData', { c: 2, o: 4 }, TTL.feed);
+    expect(get).toHaveBeenCalledWith('GetTicketData', { c: 25, o: 4 }, TTL.feed);
     expect(json).toMatchObject({ open_total: 3934, offset: 4, next_offset: 6 });
     expect(json.cols).toEqual([
       'id',
@@ -399,7 +433,7 @@ describe('get_tickets', () => {
       state: 'Open',
       achievement: { id: 100, title: 'Ach', points: 25, author: 'author' },
       game: { id: 7, title: 'Rally', console: 'PlayStation' },
-      hardcore: true,
+      hardcore: 1,
       url: 'https://retroachievements.org/ticket/118390',
     });
   });
@@ -477,7 +511,7 @@ describe('get_tickets', () => {
       URL: 'u',
     });
     const { json } = await call('get_tickets', { mode: 'most_ticketed', limit: 5 });
-    expect(get).toHaveBeenCalledWith('GetTicketData', { f: 1, c: 5, o: undefined }, TTL.feed);
+    expect(get).toHaveBeenCalledWith('GetTicketData', { f: 1, c: 25, o: undefined }, TTL.feed);
     expect(json).toEqual({
       cols: ['game_id', 'game', 'console', 'open_tickets'],
       rows: [[1, 'A', 'GBA', 32]],
@@ -504,7 +538,7 @@ describe('get_tickets', () => {
 // ---------- ra_api_raw ----------
 
 describe('ra_api_raw', () => {
-  it('ENDPOINTS = the 38 documented endpoints + GetGameRating', () => {
+  it('ENDPOINTS = the 38 documented endpoints (GetGameRating is 410 Gone)', () => {
     const file = '/tmp/ref/docs-endpoints.txt';
     const documented = exists(file)
       ? readFileSync(file, 'utf8')
@@ -512,17 +546,34 @@ describe('ra_api_raw', () => {
           .map(s => s.trim())
           .filter(Boolean)
           .map(s => s.replace(/^API_/, '').replace(/\.php$/, ''))
-      : [...ENDPOINTS].filter(e => e !== 'GetGameRating');
+      : [...ENDPOINTS];
     expect(documented).toHaveLength(38);
-    expect([...ENDPOINTS].sort()).toEqual([...documented, 'GetGameRating'].sort());
+    expect([...ENDPOINTS].sort()).toEqual([...documented].sort());
+    expect(ENDPOINTS).not.toContain('GetGameRating');
     expect(new Set(ENDPOINTS).size).toBe(ENDPOINTS.length);
   });
 
-  it('passes endpoint + params with TTL.feed; returns clean compact JSON', async () => {
+  it('passes endpoint + params with no TTL (client uses the per-endpoint default)', async () => {
     get.mockResolvedValue({ ID: 1, Empty: '', Nothing: null, List: [{ a: 1, b: null }] });
     const r = await call('ra_api_raw', { endpoint: 'GetGame', params: { i: 1, x: 'y' } });
-    expect(get).toHaveBeenCalledWith('GetGame', { i: 1, x: 'y' }, TTL.feed);
+    expect(get).toHaveBeenCalledWith('GetGame', { i: 1, x: 'y' });
     expect(r.text).toBe('{"ID":1,"List":[{"a":1}]}');
+  });
+
+  it('normalises endpoint spelling (API_ prefix, .php, case)', async () => {
+    get.mockResolvedValue({});
+    await call('ra_api_raw', { endpoint: 'API_getgameextended.php', params: { i: 1 } });
+    expect(get).toHaveBeenCalledWith('GetGameExtended', { i: 1 });
+  });
+
+  it('advertises endpoint as a plain string (no 38-value enum)', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    const raw = tools.find(t => t.name === 'ra_api_raw');
+    const ep = raw?.inputSchema.properties?.endpoint as Record<string, unknown>;
+    expect(ep.type).toBe('string');
+    expect(ep.enum).toBeUndefined();
+    await client.close();
   });
 
   it('rejects a y (API key) param', async () => {
@@ -534,9 +585,13 @@ describe('ra_api_raw', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it('rejects unknown endpoints at the schema', async () => {
-    const r = await call('ra_api_raw', { endpoint: 'SetSomething' });
-    expect(r.isError).toBe(true);
+  it('rejects unknown endpoints server-side, listing the valid names', async () => {
+    for (const endpoint of ['SetSomething', 'GetGameRating']) {
+      const r = await call('ra_api_raw', { endpoint });
+      expect(r.isError).toBe(true);
+      expect(r.text).toMatch(/Unknown endpoint/);
+      expect(r.text).toContain('GetGameExtended');
+    }
     expect(get).not.toHaveBeenCalled();
   });
 

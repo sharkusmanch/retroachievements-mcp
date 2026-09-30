@@ -10,6 +10,22 @@ const csv = z
       .filter(Boolean),
   );
 
+/**
+ * Normalise a Host-allowlist entry to the form the SDK's validator compares against
+ * (`new URL('http://' + host).hostname`): lowercase, no port, IPv6 in brackets.
+ * `*` is passed through (explicit opt-out of host validation).
+ */
+export function normalizeAllowedHost(entry: string): string {
+  const h = entry.trim().toLowerCase();
+  if (h === '*' || h === '') return h;
+  // [v6] or [v6]:port
+  const br = /^(\[[^\]]+\])(?::\d+)?$/.exec(h);
+  if (br) return br[1] as string;
+  // Bare IPv6 (two or more colons) — no port can be expressed without brackets.
+  if ((h.match(/:/g) ?? []).length >= 2) return `[${h}]`;
+  return h.replace(/:\d+$/, '');
+}
+
 const API_KEY_REQUIRED = 'RA_API_KEY (or RETROACHIEVEMENTS_API_KEY) is required';
 
 /**
@@ -35,9 +51,12 @@ const EnvSchema = z.object({
    * headers; staying at a handful of in-flight calls keeps a burst of tool calls polite.
    */
   RA_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
-  /** Client-side pacing. Measured: ~80/min sustained is fine; bursts of ~20 draw 429s. */
-  RA_RATE_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(60),
-  RA_RATE_BURST: z.coerce.number().int().min(1).max(60).default(8),
+  /**
+   * Client-side pacing (defaults: 72/min, burst 10). Measured: ~80/min sustained is fine;
+   * bursts of ~20 draw 429s. A 429 drains the bucket and pauses it for the retry wait.
+   */
+  RA_RATE_PER_MINUTE: z.coerce.number().int().min(1).max(600).default(72),
+  RA_RATE_BURST: z.coerce.number().int().min(1).max(60).default(10),
   /**
    * Directory for the persistent game-catalog cache (per-console game lists — the only
    * large, slow-changing data). Default: $XDG_CACHE_HOME or ~/.cache. Empty string or
@@ -51,14 +70,27 @@ const EnvSchema = z.object({
     .transform(v => v === 'true' || v === '1'),
   /** Cache entry ceiling. Entries are TTL'd per endpoint; this caps memory. */
   RA_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).default(500),
+  /**
+   * Cache size ceiling in bytes (estimated from response text length; default 64 MB).
+   * Single responses over ~1 MB are never cached.
+   */
+  RA_CACHE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .default(64 * 1024 * 1024),
   /** Multiplies every per-endpoint TTL. 0 disables caching entirely. */
   RA_CACHE_TTL_SCALE: z.coerce.number().min(0).default(1),
 
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_HOST: z.string().default('127.0.0.1'),
   MCP_PORT: z.coerce.number().int().min(1).max(65535).default(8080),
-  /** Host-header allowlist for DNS-rebinding protection, applied ONLY to /mcp. */
-  MCP_ALLOWED_HOSTS: csv,
+  /**
+   * Host-header allowlist for DNS-rebinding protection, applied ONLY to /mcp. Entries are
+   * normalised (lowercase, port stripped, IPv6 bracketed). Empty on a loopback bind =
+   * the SDK's localhost allowlist; `*` disables the check (logged as a warning).
+   */
+  MCP_ALLOWED_HOSTS: csv.transform(hs => [...new Set(hs.map(normalizeAllowedHost))]),
   /**
    * Optional bearer token for /mcp. When set, requests must send
    * `Authorization: Bearer <token>`. Leave unset behind a trusted network boundary.

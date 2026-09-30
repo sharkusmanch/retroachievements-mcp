@@ -14,10 +14,16 @@ await client.connect(
 if (!tool) {
   const { tools } = await client.listTools();
   const text = JSON.stringify(tools);
+  // Model-facing = what becomes the model's tool definitions (name, description,
+  // input schema); the budget test in test/budget.test.ts enforces the same measure.
+  const model = t =>
+    JSON.stringify({ name: t.name, description: t.description, inputSchema: t.inputSchema }).length;
+  const modelTotal = tools.reduce((n, t) => n + model(t), 0);
   console.log(
-    `${tools.length} tools, tools/list = ${text.length} chars (~${Math.round(text.length / 4)} tokens)`,
+    `${tools.length} tools, tools/list = ${text.length} chars on the wire; ` +
+      `model-facing ${modelTotal} chars (~${Math.round(modelTotal / 4)} tokens)`,
   );
-  for (const t of tools) console.log(`- ${t.name} (${JSON.stringify(t).length} chars)`);
+  for (const t of tools) console.log(`- ${t.name} (${model(t)} model-facing chars)`);
 } else {
   const t0 = Date.now();
   const r = await client.callTool({ name: tool, arguments: JSON.parse(args) });

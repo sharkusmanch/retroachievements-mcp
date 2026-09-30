@@ -64,52 +64,73 @@ describe('CatalogStore.get', () => {
   it('fetches GetGameList with booleans and TTL.none, then serves from memory', async () => {
     const { client, get } = fakeClient(() => Promise.resolve([game(1, 7)]));
     const store = new CatalogStore(client, capLog().log, undefined);
-    expect(store.peek(7, true, false)).toBeUndefined();
-    expect(await store.get(7, true, false)).toEqual([game(1, 7)]);
-    expect(get).toHaveBeenCalledWith('GetGameList', { i: 7, f: true, h: false }, TTL.none);
-    expect(store.peek(7, true, false)).toEqual([game(1, 7)]);
-    await store.get(7, true, false);
+    expect(store.peek(7, true)).toBeUndefined();
+    expect(await store.get(7, true)).toEqual([game(1, 7)]);
+    expect(get).toHaveBeenCalledWith('GetGameList', { i: 7, f: true }, TTL.none);
+    expect(store.peek(7, true)).toEqual([game(1, 7)]);
+    await store.get(7, true);
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it('keys by (console, withAchievements, hashes)', async () => {
+  it('keys by (console, withAchievements)', async () => {
     const { client, get } = fakeClient(() => Promise.resolve([]));
     const store = new CatalogStore(client, capLog().log, undefined);
-    await store.get(1, true, false);
-    await store.get(1, false, false);
-    await store.get(1, true, true);
-    await store.get(2, true, false);
-    expect(get).toHaveBeenCalledTimes(4);
+    await store.get(1, true);
+    await store.get(1, false);
+    await store.get(1, true);
+    await store.get(2, true);
+    expect(get).toHaveBeenCalledTimes(3);
+  });
+
+  it('stores only the searched fields, frozen', async () => {
+    const { client } = fakeClient(() =>
+      Promise.resolve([
+        { ...game(1, 7), NumAchievements: 3, ImageIcon: '/x.png', ForumTopicID: 9, Hashes: ['a'] },
+      ]),
+    );
+    const store = new CatalogStore(client, capLog().log, undefined);
+    const games = await store.get(7, true);
+    expect(games).toEqual([{ ...game(1, 7), NumAchievements: 3 }]);
+    expect(Object.keys(games[0] ?? {})).not.toContain('ImageIcon');
+    expect(Object.isFrozen(games)).toBe(true);
+    expect(Object.isFrozen(games[0])).toBe(true);
   });
 
   it('treats a null upstream body as an empty catalog', async () => {
     const { client } = fakeClient(() => Promise.resolve(null));
     const store = new CatalogStore(client, capLog().log, undefined);
-    expect(await store.get(1, true, false)).toEqual([]);
+    expect(await store.get(1, true)).toEqual([]);
   });
 
   it('coalesces concurrent loads of the same catalog', async () => {
     const d = deferred<CatalogGame[]>();
     const { client, get } = fakeClient(() => d.promise);
     const store = new CatalogStore(client, capLog().log, undefined);
-    const a = store.get(3, true, false);
-    const b = store.get(3, true, false);
+    const a = store.get(3, true);
+    const b = store.get(3, true);
     d.resolve([game(9, 3)]);
     expect(await a).toEqual(await b);
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it('memory expires after a day', async () => {
+  it('stale-while-revalidate: >1 day serves memory and refreshes in background; >7 days refetches', async () => {
     vi.useFakeTimers();
-    const { client, get } = fakeClient(() => Promise.resolve([game(1, 1)]));
+    let n = 0;
+    const { client, get } = fakeClient(() => Promise.resolve([game(++n, 1)]));
     const store = new CatalogStore(client, capLog().log, undefined);
-    await store.get(1, true, false);
+    await store.get(1, true);
     vi.advanceTimersByTime(DAY - 1);
-    expect(store.peek(1, true, false)).toBeDefined();
+    expect(await store.get(1, true)).toEqual([game(1, 1)]);
+    expect(get).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1);
-    expect(store.peek(1, true, false)).toBeUndefined();
-    await store.get(1, true, false);
+    expect(await store.get(1, true)).toEqual([game(1, 1)]); // stale copy, immediately
+    expect(get).toHaveBeenCalledTimes(2); // ...while a refresh runs
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await store.get(1, true)).toEqual([game(2, 1)]);
     expect(get).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(7 * DAY);
+    expect(store.peek(1, true)).toBeUndefined();
+    expect(await store.get(1, true)).toEqual([game(3, 1)]); // too old: refetched first
   });
 
   it('a failed load rejects and is retried on the next call', async () => {
@@ -118,16 +139,16 @@ describe('CatalogStore.get', () => {
       ++n === 1 ? Promise.reject(new Error('boom')) : Promise.resolve([game(1, 1)]),
     );
     const store = new CatalogStore(client, capLog().log, undefined);
-    await expect(store.get(1, true, false)).rejects.toThrow('boom');
-    expect(await store.get(1, true, false)).toEqual([game(1, 1)]);
+    await expect(store.get(1, true)).rejects.toThrow('boom');
+    expect(await store.get(1, true)).toEqual([game(1, 1)]);
     expect(get).toHaveBeenCalledTimes(2);
   });
 
   it('undefined dir = memory only (nothing written anywhere)', async () => {
     const { client, get } = fakeClient(() => Promise.resolve([game(1, 1)]));
-    await new CatalogStore(client, capLog().log, undefined).get(1, true, false);
+    await new CatalogStore(client, capLog().log, undefined).get(1, true);
     // A fresh store has no persistence to fall back on → upstream again.
-    await new CatalogStore(client, capLog().log, undefined).get(1, true, false);
+    await new CatalogStore(client, capLog().log, undefined).get(1, true);
     expect(get).toHaveBeenCalledTimes(2);
     expect(await readdir(dir)).toEqual([]);
   });
@@ -139,7 +160,7 @@ describe('disk layer', () => {
   it('writes atomically to the cache dir (no tmp files left behind)', async () => {
     const { client } = fakeClient(() => Promise.resolve([game(1, 7)]));
     const store = new CatalogStore(client, capLog().log, join(dir, 'nested', 'deeper'));
-    await store.get(7, true, false);
+    await store.get(7, true);
     const target = join(dir, 'nested', 'deeper', 'c7-f1-h0.json');
     await waitFor(() => exists(target));
     const stored = JSON.parse(await readFile(target, 'utf8')) as {
@@ -157,32 +178,46 @@ describe('disk layer', () => {
     const { client, get } = fakeClient(() => Promise.resolve([game(1, 7)]));
     const store = new CatalogStore(client, capLog().log, dir);
 
-    expect(await store.get(7, true, false)).toEqual([game(42, 7)]); // disk
+    expect(await store.get(7, true)).toEqual([game(42, 7)]); // disk
     expect(get).not.toHaveBeenCalled();
 
     await rm(file());
-    expect(await store.get(7, true, false)).toEqual([game(42, 7)]); // memory
+    expect(await store.get(7, true)).toEqual([game(42, 7)]); // memory
     expect(get).not.toHaveBeenCalled();
 
     const fresh = new CatalogStore(client, capLog().log, dir);
-    expect(await fresh.get(7, true, false)).toEqual([game(1, 7)]); // upstream
+    expect(await fresh.get(7, true)).toEqual([game(1, 7)]); // upstream
     expect(get).toHaveBeenCalledTimes(1);
     await waitFor(() => exists(file())); // let the background write land before cleanup
   });
 
-  it('ignores a stale disk entry and refreshes it', async () => {
+  it('serves a day-old disk entry immediately and refreshes it in the background', async () => {
     await writeFile(
       file(),
       JSON.stringify({ fetched: Date.now() - DAY - 1, games: [game(42, 7)] }),
     );
     const { client, get } = fakeClient(() => Promise.resolve([game(1, 7)]));
     const store = new CatalogStore(client, capLog().log, dir);
-    expect(await store.get(7, true, false)).toEqual([game(1, 7)]);
+    expect(await store.get(7, true)).toEqual([game(42, 7)]);
     expect(get).toHaveBeenCalledTimes(1);
     await waitFor(async () => {
       const s = JSON.parse(await readFile(file(), 'utf8')) as { games: CatalogGame[] };
       return s.games[0]?.ID === 1;
     });
+    expect(await store.get(7, true)).toEqual([game(1, 7)]);
+  });
+
+  it('refetches a week-old disk entry, but serves it if upstream fails', async () => {
+    await writeFile(
+      file(),
+      JSON.stringify({ fetched: Date.now() - 8 * DAY, games: [game(42, 7)] }),
+    );
+    const { client, get } = fakeClient(() => Promise.reject(new Error('upstream down')));
+    const { log, lines } = capLog();
+    const store = new CatalogStore(client, log, dir);
+    expect(await store.get(7, true)).toEqual([game(42, 7)]);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(lines.some(l => l.includes('serving stale copy'))).toBe(true);
   });
 
   it.each([
@@ -192,9 +227,7 @@ describe('disk layer', () => {
   ])('falls through to upstream on %s', async (_label, body) => {
     await writeFile(file(), body);
     const { client, get } = fakeClient(() => Promise.resolve([game(1, 7)]));
-    expect(await new CatalogStore(client, capLog().log, dir).get(7, true, false)).toEqual([
-      game(1, 7),
-    ]);
+    expect(await new CatalogStore(client, capLog().log, dir).get(7, true)).toEqual([game(1, 7)]);
     expect(get).toHaveBeenCalledTimes(1);
     // ...and repairs the bad file with the fresh catalog.
     await waitFor(async () => {
@@ -209,7 +242,7 @@ describe('disk layer', () => {
     const { client } = fakeClient(() => Promise.resolve([game(1, 7)]));
     const { log, lines } = capLog();
     const store = new CatalogStore(client, log, join(blocker, 'sub'));
-    expect(await store.get(7, true, false)).toEqual([game(1, 7)]);
+    expect(await store.get(7, true)).toEqual([game(1, 7)]);
     await waitFor(() => lines.some(l => l.includes('catalog cache write failed')));
   });
 });
@@ -220,8 +253,9 @@ describe('getMany', () => {
       Promise.resolve([game(Number(p.i) * 10, Number(p.i))]),
     );
     const store = new CatalogStore(client, capLog().log, undefined);
-    const r = await store.getMany([3, 1, 2], true, false, 1000);
-    expect(r.missing).toEqual([]);
+    const r = await store.getMany([3, 1, 2], true, 1000);
+    expect(r.loading).toEqual([]);
+    expect(r.failed).toEqual([]);
     expect(r.games.map(g => g.ConsoleID)).toEqual([3, 1, 2]);
   });
 
@@ -232,19 +266,20 @@ describe('getMany', () => {
     );
     const store = new CatalogStore(client, capLog().log, undefined);
     const t0 = Date.now();
-    const r = await store.getMany([1, 2, 3], true, false, 30);
+    const r = await store.getMany([1, 2, 3], true, 30);
     expect(Date.now() - t0).toBeLessThan(1000);
-    expect(r.missing).toEqual([2]);
+    expect(r.loading).toEqual([2]);
+    expect(r.failed).toEqual([]);
     expect(r.games.map(g => g.ID)).toEqual([1, 3]);
 
     slow.resolve([game(2, 2)]);
-    await waitFor(() => store.peek(2, true, false) !== undefined);
-    const again = await store.getMany([1, 2, 3], true, false, 30);
-    expect(again.missing).toEqual([]);
+    await waitFor(() => store.peek(2, true) !== undefined);
+    const again = await store.getMany([1, 2, 3], true, 30);
+    expect(again.loading).toEqual([]);
     expect(again.games.map(g => g.ID)).toEqual([1, 2, 3]);
   });
 
-  it('a failing console is reported missing and logged without breaking the others', async () => {
+  it('a failing console is reported as failed (not loading) and logged without breaking the others', async () => {
     const { client } = fakeClient((_e, p) =>
       p.i === 2
         ? Promise.reject(new Error('upstream down'))
@@ -252,8 +287,9 @@ describe('getMany', () => {
     );
     const { log, lines } = capLog();
     const store = new CatalogStore(client, log, undefined);
-    const r = await store.getMany([1, 2, 3], true, false, 1000);
-    expect(r.missing).toEqual([2]);
+    const r = await store.getMany([1, 2, 3], true, 1000);
+    expect(r.failed).toEqual([2]);
+    expect(r.loading).toEqual([]);
     expect(r.games.map(g => g.ID)).toEqual([1, 3]);
     expect(lines.some(l => l.includes('catalog load failed') && l.includes('"consoleId":2'))).toBe(
       true,
@@ -264,7 +300,7 @@ describe('getMany', () => {
     vi.useFakeTimers();
     const { client } = fakeClient(() => Promise.resolve([]));
     const store = new CatalogStore(client, capLog().log, undefined);
-    await store.getMany([1], true, false, 60_000);
+    await store.getMany([1], true, 60_000);
     expect(vi.getTimerCount()).toBe(0);
   });
 });

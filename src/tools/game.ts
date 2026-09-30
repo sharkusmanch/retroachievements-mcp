@@ -1,12 +1,15 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { RAError, TTL } from '../client.js';
-import { badgeUrl, bool, imageUrl, num, paginate, table, ts } from '../format.js';
+import { badgeUrl, bool, flag, imageUrl, num, paginate, table, ts } from '../format.js';
 import {
   handler,
   idParam,
+  imagesParam,
+  lean,
   limitParam,
   offsetParam,
+  pageBucket,
   READ_ONLY,
   resolveUser,
   ToolInputError,
@@ -26,10 +29,24 @@ interface RawConsole {
 /** Wall-clock budget for an all-consoles search before returning partial results. */
 const SEARCH_BUDGET_MS = 20_000;
 
-export async function getConsoles(ctx: ToolContext): Promise<RawConsole[]> {
+export async function getConsoles(ctx: ToolContext): Promise<readonly RawConsole[]> {
   // a=0/g=0: fetch the full list once and filter locally, so every variant of the
   // question shares one cache entry.
   return (await ctx.client.get<RawConsole[] | null>('GetConsoleIDs', {}, TTL.static)) ?? [];
+}
+
+/**
+ * Consoles whose catalogs a cross-console search loads. Game systems only; when only
+ * games WITH achievement sets are wanted, only Active systems (inactive ones have no
+ * published sets, so their catalogs would be fetched just to come back empty).
+ */
+export function searchableConsoleIds(
+  consoles: readonly RawConsole[],
+  hasAchievements: boolean,
+): number[] {
+  return consoles
+    .filter(c => c.IsGameSystem !== false && (!hasAchievements || c.Active !== false))
+    .map(c => c.ID);
 }
 
 /** Lowercase, strip punctuation, collapse whitespace. */
@@ -63,24 +80,17 @@ export function registerGameTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'list_consoles',
     {
-      description: 'List RetroAchievements consoles/systems and their IDs.',
-      inputSchema: z.object({
-        active_only: z.boolean().default(false).describe('Only systems with active development'),
-        include_non_game: z
-          .boolean()
-          .default(false)
-          .describe('Include non-game "systems" (hubs, events)'),
-      }),
+      description: 'IDs of the active RetroAchievements game systems.',
+      inputSchema: lean(z.object({})),
       annotations: READ_ONLY,
     },
-    handler(ctx, 'list_consoles', async ({ active_only, include_non_game }) => {
+    handler(ctx, 'list_consoles', async () => {
       const consoles = (await getConsoles(ctx)).filter(
-        c => (include_non_game || c.IsGameSystem !== false) && (!active_only || c.Active !== false),
+        c => c.IsGameSystem !== false && c.Active !== false,
       );
       return table(consoles, [
         ['id', c => c.ID],
         ['name', c => c.Name],
-        ['active', c => (active_only ? undefined : c.Active)],
       ]);
     }),
   );
@@ -88,76 +98,75 @@ export function registerGameTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'find_games',
     {
-      description:
-        "Search games by title and/or list a console's games. Returns IDs for the other game tools. Searching all consoles is slow on first use (catalogs are then cached).",
-      inputSchema: z.object({
-        query: z.string().min(1).max(100).optional().describe('Title words (all must match)'),
-        console_id: z.number().int().positive().optional().describe('Restrict to one console'),
-        has_achievements: z.boolean().default(true).describe('Only games with achievement sets'),
-        include_hashes: z.boolean().default(false).describe('Include ROM hashes'),
-        limit: limitParam(25, 500),
-        offset: offsetParam,
-      }),
+      description: 'Find game IDs by title and/or console. First all-console search may be slow.',
+      inputSchema: lean(
+        z.object({
+          query: z.string().min(1).max(100).optional().describe('All words must match'),
+          console_id: z.number().int().positive().optional(),
+          has_achievements: z.boolean().default(true),
+          limit: limitParam(25, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
-    handler(
-      ctx,
-      'find_games',
-      async ({ query, console_id, has_achievements, include_hashes, limit, offset }) => {
-        if (!query && console_id === undefined) {
-          throw new ToolInputError('Provide "query", "console_id", or both.');
-        }
-        const consoleIds =
-          console_id !== undefined
-            ? [console_id]
-            : (await getConsoles(ctx)).filter(c => c.IsGameSystem !== false).map(c => c.ID);
+    handler(ctx, 'find_games', async ({ query, console_id, has_achievements, limit, offset }) => {
+      if (!query && console_id === undefined) {
+        throw new ToolInputError('Provide "query", "console_id", or both.');
+      }
+      const consoleIds =
+        console_id !== undefined
+          ? [console_id]
+          : searchableConsoleIds(await getConsoles(ctx), has_achievements);
 
-        // RA has no title-search endpoint, so the catalogs ARE the index (see
-        // CatalogStore). Hashes roughly triple the payload, so they are a separate
-        // catalog variant fetched only when asked for.
-        const { games: all, missing } = await ctx.catalog.getMany(
-          consoleIds,
-          has_achievements,
-          include_hashes,
-          SEARCH_BUDGET_MS,
-        );
-        let games = all;
+      // RA has no title-search endpoint, so the catalogs ARE the index (see
+      // CatalogStore). ROM hashes live in get_game (include "hashes"), not here.
+      const {
+        games: all,
+        loading,
+        failed,
+      } = await ctx.catalog.getMany(consoleIds, has_achievements, SEARCH_BUDGET_MS);
+      let games = all;
 
-        if (query) {
-          const q = normalizeTitle(query);
-          const tokens = q.split(' ').filter(Boolean);
-          games = games
-            .map(g => ({ g, s: scoreTitle(g.Title, q, tokens) }))
-            .filter(x => x.s >= 0)
-            .sort((a, b) => b.s - a.s)
-            .map(x => x.g);
-        } else {
-          games.sort((a, b) => a.Title.localeCompare(b.Title));
-        }
+      if (query) {
+        const q = normalizeTitle(query);
+        const tokens = q.split(' ').filter(Boolean);
+        games = games
+          .map(g => ({ g, s: scoreTitle(g.Title, q, tokens) }))
+          .filter(x => x.s >= 0)
+          .sort((a, b) => b.s - a.s)
+          .map(x => x.g);
+      } else {
+        games = [...games].sort((a, b) => a.Title.localeCompare(b.Title));
+      }
 
-        const page = paginate(games, offset, limit);
-        const single = console_id !== undefined;
-        return {
-          ...(single ? { console: page.items[0]?.ConsoleName ?? console_id } : {}),
-          ...table(page.items, [
-            ['id', g => g.ID],
-            ['title', g => g.Title],
-            ['console', g => (single ? undefined : g.ConsoleName)],
-            ['achievements', g => num(g.NumAchievements)],
-            ['points', g => num(g.Points)],
-            ['leaderboards', g => num(g.NumLeaderboards) || undefined],
-            ['updated', g => ts(g.DateModified)?.slice(0, 10)],
-            ['hashes', g => (include_hashes ? g.Hashes : undefined)],
-          ]),
-          ...page.meta,
-          ...(missing.length
-            ? {
-                incomplete: `${missing.length}/${consoleIds.length} consoles not yet indexed (still loading in background); repeat the call shortly for full results`,
-              }
-            : {}),
-        };
-      },
-    ),
+      const page = paginate(games, offset, limit);
+      const single = console_id !== undefined;
+      const incomplete = [
+        loading.length
+          ? `${loading.length}/${consoleIds.length} consoles still loading in background; repeat shortly for full results`
+          : '',
+        failed.length
+          ? `${failed.length}/${consoleIds.length} consoles failed to load (upstream error); retry later`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('. ');
+      return {
+        ...(single ? { console: page.items[0]?.ConsoleName ?? console_id } : {}),
+        ...table(page.items, [
+          ['id', g => g.ID],
+          ['title', g => g.Title],
+          ['console', g => (single ? undefined : g.ConsoleName)],
+          ['achievements', g => num(g.NumAchievements)],
+          ['points', g => num(g.Points)],
+          ['leaderboards', g => num(g.NumLeaderboards) || undefined],
+          ['updated', g => ts(g.DateModified)?.slice(0, 10)],
+        ]),
+        ...page.meta,
+        ...(incomplete ? { incomplete } : {}),
+      };
+    }),
   );
 
   registerGameDetailTools(server, ctx);
@@ -313,14 +322,47 @@ function matchesType(a: RawGameAchievement, want: (typeof ACH_TYPES)[number] | u
   return want === 'none' ? !t : t === want;
 }
 
-/** Upstream `Count/Total/Results` → our `{total, next_offset}` (only when truncated). */
-function pageMeta(total: number | undefined, offset: number, returned: number) {
-  const t = total ?? offset + returned;
-  const next = offset + returned;
+/** The fields GetGame returns; projected identically from any superset response. */
+const BASE_FIELDS = [
+  'Title',
+  'ConsoleID',
+  'ConsoleName',
+  'Publisher',
+  'Developer',
+  'Genre',
+  'Released',
+  'ReleasedAtGranularity',
+  'ImageIcon',
+  'ImageBoxArt',
+] as const;
+
+/**
+ * Base game info. Served from an already-cached superset — GetGameExtended, or ANY
+ * user's GetGameInfoAndUserProgress for this game — when one is warm, else GetGame.
+ * Projected to GetGame's fields so the answer doesn't depend on what happens to be
+ * cached. (Never the reverse: InfoAndUserProgress lacks Claims/GuideURL/Updated, so it
+ * cannot stand in for GetGameExtended.)
+ */
+async function baseGame(ctx: ToolContext, id: number): Promise<RawGame | null> {
+  const warm =
+    ctx.client.peek<RawGame | null>('GetGameExtended', { i: id }) ??
+    ctx.client.peekAny<RawGame | null>('GetGameInfoAndUserProgress', { g: id });
+  if (warm && typeof warm === 'object' && !Array.isArray(warm) && warm.Title) {
+    const out: Record<string, unknown> = {};
+    for (const k of BASE_FIELDS) if (warm[k] !== undefined) out[k] = warm[k];
+    return out as unknown as RawGame;
+  }
+  return ctx.client.get<RawGame | null>('GetGame', { i: id }, TTL.game);
+}
+
+/** Paging meta when upstream was asked for `c ≥ limit` rows and we show a prefix. */
+function slicedMeta(offset: number, raw: number, shown: number, c: number, total?: number) {
+  const next = offset + shown;
+  const more = total !== undefined ? next < total : raw > shown || raw >= c;
   return {
-    total: t,
+    ...(total !== undefined ? { total } : {}),
     ...(offset > 0 ? { offset } : {}),
-    ...(next < t && returned > 0 ? { next_offset: next } : {}),
+    ...(more && shown > 0 ? { next_offset: next } : {}),
   };
 }
 
@@ -329,18 +371,17 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
     'get_game',
     {
       description:
-        'Game details, optionally with its achievement set (rarity, type), ROM hashes, median completion times, unlock distribution, or set claims.',
-      inputSchema: z.object({
-        game_id: idParam('Game'),
-        include: z.array(z.enum(GAME_INCLUDES)).max(5).default([]).describe('Extra sections'),
-        achievement_type: z
-          .enum(ACH_TYPES)
-          .optional()
-          .describe('Filter achievements by type (none = untyped)'),
-        images: z.boolean().default(false).describe('Include image URLs'),
-        limit: limitParam(50, 500),
-        offset: offsetParam,
-      }),
+        'Game details; include adds achievements (rarity, type), hashes, progression (median times), distribution, claims.',
+      inputSchema: lean(
+        z.object({
+          game_id: idParam(),
+          include: z.array(z.enum(GAME_INCLUDES)).default([]),
+          achievement_type: z.enum(ACH_TYPES).optional().describe('none = untyped'),
+          images: imagesParam,
+          limit: limitParam(50, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -357,11 +398,9 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
         // when its extras (achievements, claims) are wanted, and never call both.
         const extended = inc.has('achievements') || inc.has('claims');
         const [g, hashes, prog, dist] = await Promise.all([
-          ctx.client.get<RawGame | null>(
-            extended ? 'GetGameExtended' : 'GetGame',
-            { i: game_id },
-            TTL.game,
-          ),
+          extended
+            ? ctx.client.get<RawGame | null>('GetGameExtended', { i: game_id }, TTL.game)
+            : baseGame(ctx, game_id),
           inc.has('hashes')
             ? ctx.client.get<{ Results?: RawHash[] } | null>(
                 'GetGameHashes',
@@ -370,7 +409,7 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
               )
             : undefined,
           inc.has('progression')
-            ? ctx.client.get<RawProgression | null>('GetGameProgression', { i: game_id }, TTL.game)
+            ? ctx.client.get<RawProgression | null>('GetGameProgression', { i: game_id }, TTL.slow)
             : undefined,
           inc.has('distribution')
             ? ctx.client.get<Record<string, number> | null>(
@@ -383,10 +422,11 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
         // Unknown IDs come back as null, [] or an object without a title.
         if (!g || typeof g !== 'object' || Array.isArray(g) || !g.Title) return null;
 
+        // Copy before sorting: upstream bodies are shared (and frozen) cache values.
         const achievements = g.Achievements
-          ? (Array.isArray(g.Achievements) ? g.Achievements : Object.values(g.Achievements)).sort(
-              (a, b) => (a.DisplayOrder ?? 0) - (b.DisplayOrder ?? 0) || a.ID - b.ID,
-            )
+          ? [
+              ...(Array.isArray(g.Achievements) ? g.Achievements : Object.values(g.Achievements)),
+            ].sort((a, b) => (a.DisplayOrder ?? 0) - (b.DisplayOrder ?? 0) || a.ID - b.ID)
           : undefined;
         const players = num(g.NumDistinctPlayers) ?? num(prog?.NumDistinctPlayers);
         const released =
@@ -421,12 +461,6 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
             beat_hc: hours(prog.MedianTimeToBeatHardcore),
             complete: hours(prog.MedianTimeToComplete),
             master: hours(prog.MedianTimeToMaster),
-          };
-          out.median_samples = {
-            beat: prog.TimesUsedInBeatMedian,
-            beat_hc: prog.TimesUsedInHardcoreBeatMedian,
-            complete: prog.TimesUsedInCompletionMedian,
-            master: prog.TimesUsedInMasteryMedian,
           };
         }
         const progById = new Map((prog?.Achievements ?? []).map(a => [a.ID, a]));
@@ -474,16 +508,22 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
           };
         }
 
-        if (dist && typeof dist === 'object') {
-          // Keys are "number of achievements unlocked", values are player counts.
-          out.players_by_unlock_count = dist;
+        if (dist && typeof dist === 'object' && !Array.isArray(dist)) {
+          // Upstream keys are "number of achievements unlocked" (1..N), values player
+          // counts. As an array (index 0 = exactly 1 unlock; gaps filled with 0) the
+          // keys cost nothing; the convention is in the field name.
+          const n = Math.max(0, ...Object.keys(dist).map(Number).filter(Number.isInteger));
+          out.players_by_unlocks_from_1 = Array.from(
+            { length: n },
+            (_, i) => num(dist[i + 1]) ?? 0,
+          );
         }
 
         if (inc.has('claims')) {
           out.claims = table(g.Claims ?? [], [
             ['user', c => c.User],
             ['set', c => (c.SetType === 1 ? 'revision' : 'new')],
-            ['kind', c => (c.ClaimType === 1 ? 'collab' : 'primary')],
+            ['collab', c => flag(c.ClaimType === 1)],
             ['created', c => ts(c.Created)],
             ['expires', c => ts(c.Expiration)],
           ]);
@@ -506,10 +546,12 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
     'get_game_rankings',
     {
       description: "A game's top 10: highest scorers, or most recent masters.",
-      inputSchema: z.object({
-        game_id: idParam('Game'),
-        type: z.enum(['high_scores', 'latest_masters']).default('high_scores').describe('Ranking'),
-      }),
+      inputSchema: lean(
+        z.object({
+          game_id: idParam(),
+          type: z.enum(['high_scores', 'latest_masters']).default('high_scores'),
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(ctx, 'get_game_rankings', async ({ game_id, type }) => {
@@ -519,16 +561,12 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
           { g: game_id, t: type === 'latest_masters' ? 1 : 0 },
           TTL.feed,
         )) ?? [];
-      return {
-        game_id,
-        type,
-        ...table(Array.isArray(rows) ? rows : [], [
-          ['user', r => r.User],
-          ['achievements', r => num(r.NumAchievements)],
-          ['points', r => num(r.TotalScore)],
-          ['last_award', r => ts(r.LastAward)],
-        ]),
-      };
+      return table(Array.isArray(rows) ? rows : [], [
+        ['user', r => r.User],
+        ['achievements', r => num(r.NumAchievements)],
+        ['points', r => num(r.TotalScore)],
+        ['last_award', r => ts(r.LastAward)],
+      ]);
     }),
   );
 
@@ -536,15 +574,17 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
     'get_leaderboards',
     {
       description:
-        "List a game's leaderboards (or a user's entries on them with user_entries), or get one leaderboard's ranked entries.",
-      inputSchema: z.object({
-        game_id: z.number().int().positive().optional().describe('Game ID (list boards)'),
-        leaderboard_id: z.number().int().positive().optional().describe('Leaderboard ID (entries)'),
-        user_entries: z.boolean().default(false).describe("With game_id: the user's entries"),
-        user: userParam,
-        limit: limitParam(25, 500),
-        offset: offsetParam,
-      }),
+        "A game's leaderboards (user_entries: the user's entries), or one leaderboard's ranked entries. Give game_id or leaderboard_id.",
+      inputSchema: lean(
+        z.object({
+          game_id: z.number().int().positive().optional(),
+          leaderboard_id: z.number().int().positive().optional(),
+          user_entries: z.boolean().default(false),
+          user: userParam,
+          limit: limitParam(25, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -554,6 +594,8 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
         if ((game_id === undefined) === (leaderboard_id === undefined)) {
           throw new ToolInputError('Provide exactly one of "game_id" or "leaderboard_id".');
         }
+        // Upstream page size is bucketed (shared cache entries) and sliced here.
+        const c = pageBucket(limit);
         if (leaderboard_id !== undefined) {
           if (user_entries || user !== undefined) {
             throw new ToolInputError(
@@ -562,73 +604,76 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
           }
           const r = await ctx.client.get<RawPaged<RawEntry> | null>(
             'GetLeaderboardEntries',
-            { i: leaderboard_id, c: limit, o: offset },
+            { i: leaderboard_id, c, o: offset },
             TTL.feed,
           );
-          const rows = r?.Results ?? [];
+          const raw = r?.Results ?? [];
+          const rows = raw.slice(0, limit);
           return {
-            leaderboard_id,
             ...table(rows, [
               ['rank', e => e.Rank],
               ['user', e => e.User],
               ['score', e => e.FormattedScore ?? e.Score],
               ['date', e => ts(e.DateSubmitted)],
             ]),
-            ...pageMeta(r?.Total, offset, rows.length),
+            ...slicedMeta(offset, raw.length, rows.length, c, num(r?.Total)),
           };
         }
 
         const gid = game_id as number;
         if (user_entries || user !== undefined) {
           const u = resolveUser(ctx, user);
+          // Echo the user only when it was defaulted — the caller knows its own input.
+          const who = user === undefined ? { user: u } : {};
           let r: RawPaged<RawBoard> | null;
           try {
             r = await ctx.client.get<RawPaged<RawBoard> | null>(
               'GetUserGameLeaderboards',
-              { i: gid, u, c: limit, o: offset },
+              { i: gid, u, c, o: offset },
               TTL.user,
             );
           } catch (e) {
-            // RA answers 422 ["User has no leaderboards on this game"] for "no entries".
-            if (e instanceof RAError && e.status === 422) {
-              return { game_id: gid, user: u, total: 0, note: 'no leaderboard entries' };
+            // RA answers 422 ["User has no leaderboards on this game"] for "no entries";
+            // any other 422 (bad user, validation) is a real error.
+            if (e instanceof RAError && e.status === 422 && /no leaderboards/i.test(e.message)) {
+              return { ...who, total: 0, note: 'no leaderboard entries' };
             }
             throw e;
           }
-          const rows = r?.Results ?? [];
+          const raw = r?.Results ?? [];
+          const rows = raw.slice(0, limit);
           return {
-            game_id: gid,
-            user: u,
+            ...who,
             ...table(rows, [
               ['id', b => b.ID],
               ['title', b => b.Title],
-              ['lower_better', b => (b.RankAsc ? true : undefined)],
               ['score', b => b.UserEntry?.FormattedScore],
               ['rank', b => b.UserEntry?.Rank],
               ['date', b => ts(b.UserEntry?.DateUpdated)],
+              ['lower_better', b => flag(b.RankAsc)],
             ]),
-            ...pageMeta(r?.Total, offset, rows.length),
+            ...slicedMeta(offset, raw.length, rows.length, c, num(r?.Total)),
           };
         }
 
         const r = await ctx.client.get<RawPaged<RawBoard> | null>(
           'GetGameLeaderboards',
-          { i: gid, c: limit, o: offset },
+          { i: gid, c, o: offset },
           TTL.game,
         );
-        const rows = r?.Results ?? [];
+        const raw = r?.Results ?? [];
+        const rows = raw.slice(0, limit);
         return {
-          game_id: gid,
           ...table(rows, [
             ['id', b => b.ID],
             ['title', b => b.Title.trim()],
             ['description', b => b.Description],
-            ['lower_better', b => (b.RankAsc ? true : undefined)],
-            ['state', b => (b.State && b.State !== 'active' ? b.State : undefined)],
             ['top_user', b => b.TopEntry?.User],
             ['top_score', b => b.TopEntry?.FormattedScore],
+            ['lower_better', b => flag(b.RankAsc)],
+            ['state', b => (b.State && b.State !== 'active' ? b.State : undefined)],
           ]),
-          ...pageMeta(r?.Total, offset, rows.length),
+          ...slicedMeta(offset, raw.length, rows.length, c, num(r?.Total)),
         };
       },
     ),
@@ -637,13 +682,15 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'get_achievement_unlocks',
     {
-      description: 'Who unlocked an achievement, most recent first, with its unlock rates.',
-      inputSchema: z.object({
-        achievement_id: idParam('Achievement'),
-        hardcore_only: z.boolean().default(false).describe('Hardcore unlocks only'),
-        limit: limitParam(25, 500),
-        offset: offsetParam,
-      }),
+      description: 'Who unlocked an achievement (newest first), with unlock rates.',
+      inputSchema: lean(
+        z.object({
+          achievement_id: idParam(),
+          hardcore_only: z.boolean().default(false),
+          limit: limitParam(25, 500),
+          offset: offsetParam,
+        }),
+      ),
       annotations: READ_ONLY,
     },
     handler(
@@ -652,8 +699,9 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
       async ({ achievement_id, hardcore_only, limit, offset }) => {
         // Upstream has no hardcore filter, so with hardcore_only we over-fetch (4× the
         // limit, capped at the upstream max of 500) and filter; next_offset then points
-        // into the UPSTREAM list, just past the last row scanned.
-        const fetch = hardcore_only ? Math.min(500, limit * 4) : limit;
+        // into the UPSTREAM list, just past the last row scanned. The page size is
+        // bucketed (shared cache entries) and the rows sliced here.
+        const fetch = pageBucket(hardcore_only ? Math.min(500, limit * 4) : limit);
         const r = await ctx.client.get<RawUnlocks | null>(
           'GetAchievementUnlocks',
           { a: achievement_id, c: fetch, o: offset },
@@ -661,8 +709,8 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
         );
         if (!r?.Achievement) return null;
         const all = r.Unlocks ?? [];
-        let rows = all;
-        let scanned = all.length;
+        let rows = all.slice(0, limit);
+        let scanned = rows.length;
         if (hardcore_only) {
           rows = [];
           scanned = 0;
@@ -695,7 +743,7 @@ function registerGameDetailTools(server: McpServer, ctx: ToolContext): void {
           ...table(rows, [
             ['user', u => u.User],
             ['date', u => ts(u.DateAwarded)],
-            ['hc', u => (hardcore_only ? undefined : (bool(u.HardcoreMode) ?? false))],
+            ['hc', u => (hardcore_only ? undefined : flag(bool(u.HardcoreMode)))],
           ]),
           ...(offset > 0 ? { offset } : {}),
           ...(total !== undefined && next < total && scanned > 0 ? { next_offset: next } : {}),

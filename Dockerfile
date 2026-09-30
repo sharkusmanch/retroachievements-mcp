@@ -6,7 +6,10 @@
 ARG NODE_VERSION=24.21.0
 
 # ---------- build ----------
-FROM node:${NODE_VERSION}-alpine AS build
+# Build on the runner's native platform: the output is platform-independent JS and no
+# production dependency has native code or install scripts, so there is no reason to
+# run npm/tsc under QEMU for arm64.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 # --ignore-scripts: `prepare` runs the build, and src/ isn't copied yet.
@@ -44,6 +47,11 @@ ENV NODE_ENV=production \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
+
+# Pre-create the cache dir owned by `node`, so a named volume mounted here inherits
+# writable ownership (Docker copies image ownership into a fresh volume):
+#   docker run -i --rm -v retroachievements-mcp-cache:/tmp/retroachievements-mcp …
+RUN mkdir -p /tmp/retroachievements-mcp && chown node:node /tmp/retroachievements-mcp
 
 USER node
 EXPOSE 8080

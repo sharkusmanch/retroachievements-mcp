@@ -4,7 +4,7 @@ import { applyArgs, loadConfig } from './config.js';
 import { createLogger, registerSecret } from './logger.js';
 import { RAClient } from './client.js';
 import { CatalogStore, defaultCacheDir } from './catalog.js';
-import { getConsoles } from './tools/game.js';
+import { getConsoles, searchableConsoleIds } from './tools/game.js';
 import { createServer } from './server.js';
 import { serveHttp } from './http.js';
 import type { ToolContext } from './tools/common.js';
@@ -64,20 +64,28 @@ if (cfg.MCP_TRANSPORT === 'http') {
   serveHttp(ctx, cfg);
   if (cfg.RA_PREWARM_CATALOG) void prewarm();
 } else {
+  // As PID 1 in `docker run -i`, node ignores SIGTERM unless a handler exists, so
+  // `docker stop` would wait out its grace period. Nothing to drain in stdio mode.
+  for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, () => process.exit(0));
   const server = createServer(ctx);
   await server.connect(new StdioServerTransport());
   log.info('retroachievements-mcp ready (stdio)', { version: VERSION });
 }
 
 /**
- * Background warm of every console catalog so the first cross-console search is fast.
- * Rate-limited by the client like any other traffic; failures are logged and ignored.
+ * Background warm of every active console's catalog (the set find_games searches by
+ * default) so the first cross-console search is fast. Rate-limited by the client like
+ * any other traffic; failures are logged and ignored.
  */
 async function prewarm(): Promise<void> {
   try {
-    const ids = (await getConsoles(ctx)).filter(c => c.IsGameSystem !== false).map(c => c.ID);
-    const r = await ctx.catalog.getMany(ids, true, false, 10 * 60_000);
-    log.info('catalog prewarm complete', { consoles: ids.length, missing: r.missing.length });
+    const ids = searchableConsoleIds(await getConsoles(ctx), true);
+    const r = await ctx.catalog.getMany(ids, true, 10 * 60_000);
+    log.info('catalog prewarm complete', {
+      consoles: ids.length,
+      failed: r.failed.length,
+      loading: r.loading.length,
+    });
   } catch (e) {
     log.warn('catalog prewarm failed', e);
   }

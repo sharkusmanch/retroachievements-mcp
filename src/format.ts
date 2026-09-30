@@ -89,8 +89,10 @@ export interface Table {
 
 /**
  * Array of records → table. Columns whose value is empty on EVERY row are dropped
- * entirely (e.g. `hardcore_date` for a softcore-only player), and remaining empties are
- * emitted as `null` to keep row arity fixed.
+ * entirely (e.g. `hardcore_date` for a softcore-only player). Mostly-empty columns
+ * (filled on fewer than half the rows) move to the end, most-filled first, and each row
+ * drops its trailing empty cells — so sparse data costs almost nothing. Remaining
+ * interior empties are `null` to keep positions aligned with `cols`.
  */
 export function table<T>(items: readonly T[], cols: readonly Column<T>[]): Table {
   const raw = items.map(it =>
@@ -99,11 +101,26 @@ export function table<T>(items: readonly T[], cols: readonly Column<T>[]): Table
       return v === undefined || v === '' ? null : v;
     }),
   );
-  const keep = cols.map((_, i) => raw.some(r => r[i] !== null));
+  const filled = cols.map((_, i) => raw.reduce((n, r) => n + (r[i] !== null ? 1 : 0), 0));
+  const kept = cols.map((_, i) => i).filter(i => (filled[i] ?? 0) > 0);
+  const dense = (i: number) => (filled[i] ?? 0) * 2 >= raw.length;
+  const order = [
+    ...kept.filter(dense),
+    ...kept.filter(i => !dense(i)).sort((a, b) => (filled[b] ?? 0) - (filled[a] ?? 0) || a - b),
+  ];
   return {
-    cols: cols.filter((_, i) => keep[i]).map(([n]) => n),
-    rows: raw.map(r => r.filter((_, i) => keep[i])),
+    cols: order.map(i => (cols[i] as Column<T>)[0]),
+    rows: raw.map(r => {
+      const row = order.map(i => r[i]);
+      while (row.length && row[row.length - 1] === null) row.pop();
+      return row;
+    }),
   };
+}
+
+/** Boolean-ish flag → `1`, else omitted (so an all-false column disappears). */
+export function flag(v: unknown): 1 | undefined {
+  return v === true || v === 1 || v === '1' ? 1 : undefined;
 }
 
 export interface Page<T> {

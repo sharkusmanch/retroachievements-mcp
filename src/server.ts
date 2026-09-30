@@ -6,10 +6,10 @@ import { registerCommunityTools } from './tools/community.js';
 import { VERSION } from './version.js';
 
 const INSTRUCTIONS = [
-  'Read-only access to the RetroAchievements (RA) Web API.',
-  'User tools default to the configured user when "user" is omitted.',
-  'Results are compact JSON; lists are tables {"cols":[...],"rows":[[...]]}; empty fields are omitted.',
-  'Find a game ID with find_games before calling game tools. Prefer narrow calls (limit, filters) over broad ones.',
+  'Read-only RetroAchievements (RA) Web API; "user" defaults to the configured user.',
+  'Results are compact JSON. Lists are tables {"cols":[...],"rows":[[...]]}; rows may omit trailing empty cells.',
+  'Empty fields are omitted; flags (hc, collab, ...) are 1 or omitted; *_hc = hardcore.',
+  'Get game IDs from find_games. Prefer narrow calls (limit, filters).',
 ].join(' ');
 
 /**
